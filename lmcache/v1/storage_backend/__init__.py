@@ -263,6 +263,20 @@ def CreateStorageBackends(
         storage_backends[str(gds_backend)] = gds_backend
 
     if enable_iou_dmabuf and "IouDmabufBackend" not in _skip:
+        # First cut requires a LocalCPUBackend as the global staging allocator.
+        # StorageManager.batched_put stages foreign source objects into each
+        # backend's allocator via allocate_and_copy_objects, producing
+        # IouDmabufBackend-owned GPU copies that take the WRITE_FIXED fast path.
+        # Without LocalCPUBackend, IouDmabufBackend would become the global
+        # allocator and any foreign GPU source object would be silently rejected
+        # (it only accepts allocator-owned GPU memory). Require CPU staging so
+        # that path cannot be hit.
+        if "LocalCPUBackend" not in storage_backends:
+            raise ValueError(
+                "iou_dmabuf.enabled=true requires a LocalCPUBackend staging "
+                "allocator in the first cut; set max_local_cpu_size > 0 (and do "
+                "not run IouDmabufBackend as the sole allocator)"
+            )
         if IouDmabufBackend.is_available():
             iou_backend = IouDmabufBackend(config, metadata, loop, dst_device)
             storage_backends[str(iou_backend)] = iou_backend

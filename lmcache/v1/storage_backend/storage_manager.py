@@ -321,9 +321,10 @@ class StorageManager:
                 allocator_backend = self.storage_backends["MaruBackend"]
         elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
-        elif "IouDmabufBackend" in self.storage_backends:
-            allocator_backend = self.storage_backends["IouDmabufBackend"]
         else:
+            # IouDmabufBackend intentionally does not appear here: it requires a
+            # LocalCPUBackend staging allocator (enforced in CreateStorageBackends)
+            # so it is never the global allocator. See iou_dmabuf_backend design.
             raise RuntimeError("No allocator backend is available")
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend

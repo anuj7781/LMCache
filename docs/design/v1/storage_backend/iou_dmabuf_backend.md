@@ -1094,6 +1094,12 @@ if (
     and config.extra_config.get("iou_dmabuf.enabled", False)
     and "IouDmabufBackend" not in _skip
 ):
+    # First cut: hard-require a LocalCPUBackend staging allocator (see below).
+    if "LocalCPUBackend" not in storage_backends:
+        raise ValueError(
+            "iou_dmabuf.enabled=true requires a LocalCPUBackend staging "
+            "allocator; set max_local_cpu_size > 0"
+        )
     if IouDmabufBackend.is_available():
         iou_backend = IouDmabufBackend(config, metadata, loop, dst_device)
         storage_backends[str(iou_backend)] = iou_backend   # keyed by name, not appended
@@ -1105,20 +1111,27 @@ if (
         )
 ```
 
-**Traversal shadowing (finding 3).** `StorageManager.batched_get()` iterates
+**Overlap rejection (strict, first cut).** `StorageManager.batched_get()` iterates
 `get_active_storage_backends(location)` and **returns from the first backend that
 yields results** (`storage_manager.py:489`). Insertion order in the `OrderedDict`
 is the traversal order, and `IouDmabufBackend` is inserted after `LocalDiskBackend`
-and `GdsBackend`. So if an overlapping disk backend is also enabled and holds the
-key, the dmabuf backend is **never exercised**. For the first cut, do not rely on
-default traversal to reach it. Require one of:
+and `GdsBackend`, so an overlapping disk backend holding the key would shadow it.
+Rather than rely on traversal order or ad-hoc `location=` addressing, the first cut
+**rejects overlapping local disk backends at construction**: enabling
+`iou_dmabuf.enabled: true` together with `local_disk`/`gds_path` (without skipping
+them) raises a `ValueError` in `CreateStorageBackends`. Operators must disable the
+overlapping disk backend, so `IouDmabufBackend` is the only local-NVMe backend in
+`storage_backends`. (`location="IouDmabufBackend"` still works for explicit reads,
+but is not required and is not the sanctioned way to resolve overlap.)
 
-1. **Disable overlapping disk backends** when `iou_dmabuf.enabled: true` (do not also
-   set `local_disk`/`gds_path` for the same data), so `IouDmabufBackend` is the only
-   local-NVMe backend in `storage_backends`; **or**
-2. **Address it explicitly** via `location="IouDmabufBackend"` on the get/put call —
-   `get_active_storage_backends` filters to the exact backend name
-   (`storage_manager.py:1189`), bypassing ordering entirely.
+**Staging-allocator requirement.** `IouDmabufBackend` is never the *global* allocator
+in the first cut: it requires a `LocalCPUBackend` (`max_local_cpu_size > 0`), enforced
+above. `StorageManager.batched_put` stages every source object into each backend's
+allocator via `allocate_and_copy_objects` (`storage_manager.py:425`), which for this
+backend produces `IouDmabufBackend`-owned GPU copies that take the `WRITE_FIXED` fast
+path (§10). Were it the sole allocator, a foreign GPU source object could reach
+`_put_one` and be silently rejected (§10 rejects unowned GPU memory). Forcing CPU
+staging removes that path; a first-class GPU→GPU staging copy is deferred.
 
 `NixlStorageBackend` is unaffected (different storage tier). Promoting the dmabuf
 backend ahead of `GdsBackend` in default traversal is deferred until it is stable.

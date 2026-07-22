@@ -957,10 +957,18 @@ class IouDmabufBackend(AllocatorBackendInterface):
         del lookup_id, transfer_spec
         results = await asyncio.to_thread(self.batched_get_blocking, keys)
         loaded: list[MemoryObj] = []
+        hole_seen = False
         for obj in results:
             if obj is None:
-                break
-            loaded.append(obj)
+                hole_seen = True
+                continue
+            if hole_seen:
+                # Only the leading contiguous prefix is returned. Any object
+                # loaded after a miss was allocated and read but will not be
+                # returned, so release its reference here to avoid a leak.
+                obj.ref_count_down()
+            else:
+                loaded.append(obj)
         return loaded
 
     async def batched_async_contains(
@@ -1297,8 +1305,14 @@ class IouDmabufBackend(AllocatorBackendInterface):
         raw_key = encode_legacy_key(key)
         try:
             if self.memory_allocator.owns(memory_obj):
-                self._put_owned_gpu(raw_key, memory_obj)
-                self._invoke_callback(on_complete_callback, key)
+                if self._put_owned_gpu(raw_key, memory_obj):
+                    self._invoke_callback(on_complete_callback, key)
+                else:
+                    logger.debug(
+                        "IouDmabufBackend: GPU put for %s stored nothing "
+                        "(no free slot or duplicate key); callback not fired",
+                        key,
+                    )
                 return
             if self._is_cpu_readable_source(memory_obj):
                 result = self._core.put_many([raw_key], [memory_obj])
@@ -1316,12 +1330,27 @@ class IouDmabufBackend(AllocatorBackendInterface):
             with self._put_lock:
                 self._put_tasks.discard(key)
 
-    def _put_owned_gpu(self, raw_key: RawBlockKeySpec, memory_obj: MemoryObj) -> None:
+    def _put_owned_gpu(self, raw_key: RawBlockKeySpec, memory_obj: MemoryObj) -> bool:
+        """Write an allocator-owned GPU object via WRITE_FIXED.
+
+        Args:
+            raw_key: Encoded raw-block key spec.
+            memory_obj: Source object owned by this backend's GPU pool.
+
+        Returns:
+            True only when the payload was written and committed to the index.
+            False means no slot was reserved (pool full, or the key is already
+            in-flight/indexed) and nothing was stored.
+
+        Raises:
+            RuntimeError: If a reserved slot's header write, dmabuf write, or
+                commit fails; the slot is aborted before propagating.
+        """
         payload_len = int(memory_obj.get_size())
         total_len = round_up(payload_len, self.block_align)
         slot_base_offset = self._core.reserve_slot(raw_key, memory_obj)
         if slot_base_offset is None:
-            return
+            return False
 
         committed = False
         try:
@@ -1344,6 +1373,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
         finally:
             if not committed:
                 self._core.abort_slot(raw_key, slot_base_offset)
+        return committed
 
     def _read_into_dmabuf(
         self,

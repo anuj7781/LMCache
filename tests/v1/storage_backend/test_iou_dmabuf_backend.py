@@ -168,6 +168,7 @@ class _FakeAllocator:
         self.slabs = [SimpleNamespace(size=pool_bytes, dmabuf_fd=123, buf_slot=0)]
         self.closed = False
         self._next_address = 0
+        self.allocated: list[MemoryObj] = []
         _FakeAllocator.instances.append(self)
 
     def owns(self, obj: MemoryObj) -> bool:
@@ -194,6 +195,7 @@ class _FakeAllocator:
         obj.meta.shape = shapes if isinstance(shapes, torch.Size) else shapes[0]
         obj.meta.dtype = dtypes if isinstance(dtypes, torch.dtype) else dtypes[0]
         self._next_address += 4096
+        self.allocated.append(obj)
         return obj
 
     def batched_allocate(
@@ -405,6 +407,45 @@ def test_iou_dmabuf_owned_gpu_source_uses_write_fixed_dmabuf(
         backend.close()
 
 
+def test_iou_dmabuf_owned_gpu_no_slot_does_not_report_success(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    key = _make_key()
+    source = _make_memory_obj(
+        3,
+        parent_allocator=backend.memory_allocator,
+        address=4096,
+    )
+    completed: list[CacheEngineKey] = []
+    core = _FakeCore.instances[-1]
+    # Simulate a full pool / duplicate key: reservation yields no slot.
+    core.reserve_slot = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    try:
+        futures = backend.batched_submit_put_task(
+            [key],
+            [source],
+            on_complete_callback=completed.append,
+        )
+        assert futures is not None
+        futures[0].result(timeout=5)
+        # Nothing stored -> the completion callback must not fire, and no
+        # header/write/commit/abort should have run.
+        assert completed == []
+        assert core.headers == []
+        assert core.commits == []
+        assert core.aborts == []
+        assert core.rawdev.writes == []
+        assert source.get_ref_count() == 1
+    finally:
+        backend.close()
+
+
 def test_iou_dmabuf_rejects_foreign_gpu_source(
     patched_backend: None,
 ) -> None:
@@ -473,6 +514,51 @@ def test_iou_dmabuf_read_locks_until_io_finishes(
         backend.close()
 
 
+def test_iou_dmabuf_non_blocking_get_releases_tail_after_hole(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    first = _make_key(1)
+    hole = _make_key(2)
+    tail = _make_key(3)
+    core = _FakeCore.instances[-1]
+    for key in (first, tail):  # note: `hole` is intentionally absent
+        core.entries[key.to_string()] = (
+            DiskCacheMetadata(
+                path="/dev/nvme0n1@8192",
+                size=3,
+                shape=torch.Size([3]),
+                dtype=torch.uint8,
+                fmt=MemoryFormat.KV_2LTD,
+            ),
+            8192,
+        )
+
+    loop = asyncio.new_event_loop()
+    try:
+        loaded = loop.run_until_complete(
+            backend.batched_get_non_blocking("lookup", [first, hole, tail])
+        )
+        # Only the leading prefix (before the miss) is returned.
+        assert len(loaded) == 1
+        alloc = _FakeAllocator.instances[-1]
+        # One object allocated per hit (first, tail).
+        assert len(alloc.allocated) == 2
+        returned_obj, tail_obj = alloc.allocated
+        # The returned prefix object keeps its reference; the tail object loaded
+        # after the hole must be released, not leaked.
+        assert loaded[0] is returned_obj
+        assert returned_obj.get_ref_count() == 1
+        assert tail_obj.get_ref_count() == 0
+    finally:
+        loop.close()
+        backend.close()
+
+
 def test_iou_dmabuf_read_total_miss_returns_empty_list(
     patched_backend: None,
 ) -> None:
@@ -498,6 +584,20 @@ def test_create_storage_backends_rejects_overlapping_local_disk() -> None:
     )
 
     with pytest.raises(ValueError, match="LocalDiskBackend"):
+        CreateStorageBackends(config, _make_metadata(), asyncio.new_event_loop())
+
+
+def test_create_storage_backends_requires_local_cpu_staging() -> None:
+    # iou enabled, no overlapping disk backend, but no CPU staging allocator
+    # (max_local_cpu_size=0) -> IouDmabufBackend must refuse to be the sole
+    # allocator.
+    config = LMCacheEngineConfig.from_defaults(
+        local_cpu=False,
+        max_local_cpu_size=0,
+        extra_config=_make_config().extra_config,
+    )
+
+    with pytest.raises(ValueError, match="LocalCPUBackend"):
         CreateStorageBackends(config, _make_metadata(), asyncio.new_event_loop())
 
 

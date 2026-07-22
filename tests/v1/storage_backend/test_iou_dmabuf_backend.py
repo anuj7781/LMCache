@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock
 import asyncio
+import ctypes
 import os
 import sys
 import types
@@ -162,11 +163,13 @@ class _FakeAllocator:
         device: str,
         block_align: int,
         exporter: str = "auto",
+        mem_range_flags: int = 0,
     ) -> None:
         self.pool_bytes = pool_bytes
         self.device = device
         self.block_align = block_align
         self.exporter = exporter
+        self.mem_range_flags = mem_range_flags
         self.dmabuf_fds = [123]
         self.slabs = [SimpleNamespace(size=pool_bytes, dmabuf_fd=123, buf_slot=0)]
         self.closed = False
@@ -708,9 +711,117 @@ def test_allocate_and_copy_objects_skips_present_keys_without_misaligning(
     assert objs[0] is allocator.made[0]
 
 
+def test_dmabuf_exporter_auto_prefers_hip_on_rocm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # First Party
+    from lmcache.v1.storage_backend import iou_dmabuf_backend as mod
+
+    monkeypatch.setattr(mod, "_torch_uses_hip", lambda: True)
+    assert mod._resolve_dmabuf_exporter("auto") == "hip"
+    assert mod._resolve_dmabuf_exporter("HIP") == "hip"
+
+    monkeypatch.setattr(mod, "_torch_uses_hip", lambda: False)
+    assert mod._resolve_dmabuf_exporter("auto") == "cuda_pool"
+    assert mod._resolve_dmabuf_exporter("cuda_pool") == "cuda_pool"
+
+
+def test_iou_dmabuf_allocator_receives_mem_range_flags(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config({"iou_dmabuf.mem_range_flags": 1}),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+
+    try:
+        allocator = _FakeAllocator.instances[-1]
+        assert allocator.mem_range_flags == 1
+    finally:
+        backend.close()
+
+
+def test_iou_dmabuf_rejects_negative_mem_range_flags(
+    patched_backend: None,
+) -> None:
+    with pytest.raises(ValueError, match="iou_dmabuf.mem_range_flags"):
+        IouDmabufBackend(
+            _make_config({"iou_dmabuf.mem_range_flags": -1}),
+            _make_metadata(),
+            asyncio.new_event_loop(),
+        )
+
+
+def test_hip_driver_exports_dmabuf_with_address_range_handle_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # First Party
+    from lmcache.v1.storage_backend import iou_dmabuf_backend as mod
+
+    class _FakeCFunc:
+        def __init__(self, impl: Any) -> None:
+            self._impl = impl
+            self.argtypes: list[Any] | None = None
+            self.restype: Any = None
+
+        def __call__(self, *args: Any) -> int:
+            return int(self._impl(*args))
+
+    class _FakeHipLib:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+            self.hipInit = _FakeCFunc(self._hip_init)
+            self.hipSetDevice = _FakeCFunc(self._hip_set_device)
+            self.hipMemGetHandleForAddressRange = _FakeCFunc(self._export)
+
+        @staticmethod
+        def _value(value: Any) -> int:
+            return int(value.value if hasattr(value, "value") else value)
+
+        def _hip_init(self, flags: Any) -> int:
+            self.calls.append(("hipInit", self._value(flags)))
+            return 0
+
+        def _hip_set_device(self, device: Any) -> int:
+            self.calls.append(("hipSetDevice", self._value(device)))
+            return 0
+
+        def _export(
+            self,
+            handle: Any,
+            dptr: Any,
+            size: Any,
+            handle_type: Any,
+            flags: Any,
+        ) -> int:
+            ctypes.cast(handle, ctypes.POINTER(ctypes.c_int)).contents.value = 456
+            self.calls.append(
+                (
+                    "hipMemGetHandleForAddressRange",
+                    self._value(dptr),
+                    self._value(size),
+                    self._value(handle_type),
+                    self._value(flags),
+                )
+            )
+            return 0
+
+    fake_lib = _FakeHipLib()
+    monkeypatch.setattr(mod, "_load_shared_library", lambda _: fake_lib)
+
+    driver = mod._HipDriver(device_index=2)
+    assert driver.export_dmabuf(0x1000, 4096, flags=1) == 456
+    assert fake_lib.calls == [
+        ("hipInit", 0),
+        ("hipSetDevice", 2),
+        ("hipMemGetHandleForAddressRange", 0x1000, 4096, 1, 1),
+    ]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="DmabufGPUAllocator requires a CUDA device",
+    reason="DmabufGPUAllocator requires a torch CUDA/HIP device",
 )
 def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
     monkeypatch: pytest.MonkeyPatch,
@@ -729,7 +840,13 @@ def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
     # Avoid the libcuda dependency: hand back closeable fds instead of
     # exporting real DMA-BUFs. The pool tensor itself is still real CUDA memory.
     class _FakeCudaDriver:
-        def export_dmabuf(self, device_ptr: int, size: int) -> int:
+        def export_dmabuf(
+            self,
+            device_ptr: int,
+            size: int,
+            flags: int = 0,
+        ) -> int:
+            del device_ptr, size, flags
             return os.open(os.devnull, os.O_RDONLY)
 
     monkeypatch.setattr(mod, "_CudaDriver", _FakeCudaDriver)

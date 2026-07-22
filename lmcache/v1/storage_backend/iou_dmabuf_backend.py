@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Union
 import asyncio
 import ctypes
+import ctypes.util
 import os
 import threading
 import time
@@ -55,13 +56,16 @@ _SZ_1G = 1 << 30
 _CU_SUCCESS = 0
 _CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
 
+_HIP_SUCCESS = 0
+_HIP_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
+
 
 @dataclass(frozen=True)
 class SlabDescriptor:
     """Registered GPU dmabuf slab metadata.
 
     Args:
-        device_ptr: CUDA device virtual address for the slab base.
+        device_ptr: GPU device virtual address for the slab base.
         dmabuf_fd: Exported DMA-BUF file descriptor.
         buf_slot: io_uring registered buffer table index.
         size: Slab length in bytes.
@@ -71,6 +75,61 @@ class SlabDescriptor:
     dmabuf_fd: int
     buf_slot: int
     size: int
+
+
+def _load_shared_library(names: Sequence[str]) -> ctypes.CDLL:
+    """Load the first available shared library from ``names``."""
+    errors: list[str] = []
+    tried: set[str] = set()
+    for name in names:
+        candidates: list[str] = []
+        found = ctypes.util.find_library(name)
+        if found is not None:
+            candidates.append(found)
+        candidates.append(name)
+        if not name.startswith("lib") and ".so" not in name:
+            candidates.append(f"lib{name}.so")
+
+        for candidate in candidates:
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError as e:
+                errors.append(f"{candidate}: {e}")
+
+    raise OSError("; ".join(errors) or "no shared library candidates supplied")
+
+
+def _torch_uses_hip() -> bool:
+    """Return whether this PyTorch build targets ROCm/HIP."""
+    return bool(getattr(torch.version, "hip", None))
+
+
+def _resolve_dmabuf_exporter(exporter: str) -> str:
+    """Resolve ``auto`` and validate the requested dmabuf exporter."""
+    normalized = exporter.strip().lower()
+    if normalized == "auto":
+        return "hip" if _torch_uses_hip() else "cuda_pool"
+    if normalized in {"cuda_pool", "hip"}:
+        return normalized
+    if normalized in {"cuda_vmm", "amd_drm"}:
+        raise NotImplementedError(
+            f"IouDmabufBackend exporter='{normalized}' is still deferred; "
+            "first cut supports exporter='auto', exporter='cuda_pool', "
+            "or exporter='hip'"
+        )
+    raise ValueError(
+        "IouDmabufBackend exporter must be one of: auto, cuda_pool, hip"
+    )
+
+
+def _torch_cuda_device_index(device: torch.device) -> int:
+    """Return the active torch CUDA/HIP device index for driver calls."""
+    if device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device())
 
 
 class _CudaDriver:
@@ -104,12 +163,13 @@ class _CudaDriver:
         export_fn.restype = ctypes.c_int
         self._export_fn = export_fn
 
-    def export_dmabuf(self, device_ptr: int, size: int) -> int:
+    def export_dmabuf(self, device_ptr: int, size: int, flags: int = 0) -> int:
         """Export a CUDA device address range as a DMA-BUF fd.
 
         Args:
             device_ptr: Page-aligned CUDA device pointer.
             size: Page-aligned range size in bytes.
+            flags: CUDA address-range export flags.
 
         Returns:
             The exported DMA-BUF file descriptor.
@@ -124,7 +184,7 @@ class _CudaDriver:
                 ctypes.c_uint64(device_ptr),
                 ctypes.c_size_t(size),
                 ctypes.c_uint(_CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD),
-                ctypes.c_ulonglong(0),
+                ctypes.c_ulonglong(flags),
             )
         )
         if rc != _CU_SUCCESS:
@@ -135,6 +195,96 @@ class _CudaDriver:
         if fd.value < 0:
             raise RuntimeError(
                 "cuMemGetHandleForAddressRange succeeded but returned an invalid fd"
+            )
+        return int(fd.value)
+
+
+class _HipDriver:
+    """Small ctypes wrapper for HIP dmabuf address-range export."""
+
+    def __init__(self, device_index: int) -> None:
+        # Try the ldconfig-resolved soname first (covers whichever ROCm major is
+        # installed), then explicit versioned fallbacks for runtime-only installs
+        # that ship only ``libamdhip64.so.<N>`` (no unversioned dev symlink).
+        self._lib = _load_shared_library(
+            (
+                "amdhip64",
+                "libamdhip64.so.6",
+                "libamdhip64.so.5",
+                "libamdhip64.so",
+            )
+        )
+
+        try:
+            init_fn = self._lib.hipInit
+        except AttributeError as e:
+            raise RuntimeError("HIP runtime does not expose hipInit") from e
+        init_fn.argtypes = [ctypes.c_uint]
+        init_fn.restype = ctypes.c_int
+        rc = int(init_fn(0))
+        if rc != _HIP_SUCCESS:
+            raise RuntimeError(f"hipInit failed with HIP error {rc}")
+
+        try:
+            set_device_fn = self._lib.hipSetDevice
+        except AttributeError as e:
+            raise RuntimeError("HIP runtime does not expose hipSetDevice") from e
+        set_device_fn.argtypes = [ctypes.c_int]
+        set_device_fn.restype = ctypes.c_int
+        rc = int(set_device_fn(ctypes.c_int(device_index)))
+        if rc != _HIP_SUCCESS:
+            raise RuntimeError(
+                f"hipSetDevice({device_index}) failed with HIP error {rc}"
+            )
+
+        try:
+            export_fn = self._lib.hipMemGetHandleForAddressRange
+        except AttributeError as e:
+            raise RuntimeError(
+                "HIP runtime does not expose hipMemGetHandleForAddressRange"
+            ) from e
+        export_fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_size_t,
+            ctypes.c_uint,
+            ctypes.c_ulonglong,
+        ]
+        export_fn.restype = ctypes.c_int
+        self._export_fn = export_fn
+
+    def export_dmabuf(self, device_ptr: int, size: int, flags: int = 0) -> int:
+        """Export a HIP device address range as a DMA-BUF fd.
+
+        Args:
+            device_ptr: Page-aligned HIP device pointer.
+            size: Page-aligned range size in bytes.
+            flags: HIP address-range export flags.
+
+        Returns:
+            The exported DMA-BUF file descriptor.
+
+        Raises:
+            RuntimeError: If HIP rejects the address range export.
+        """
+        fd = ctypes.c_int(-1)
+        rc = int(
+            self._export_fn(
+                ctypes.byref(fd),
+                ctypes.c_uint64(device_ptr),
+                ctypes.c_size_t(size),
+                ctypes.c_uint(_HIP_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD),
+                ctypes.c_ulonglong(flags),
+            )
+        )
+        if rc != _HIP_SUCCESS:
+            raise RuntimeError(
+                "hipMemGetHandleForAddressRange failed with HIP error "
+                f"{rc} for ptr={device_ptr:#x}, size={size}"
+            )
+        if fd.value < 0:
+            raise RuntimeError(
+                "hipMemGetHandleForAddressRange succeeded but returned an invalid fd"
             )
         return int(fd.value)
 
@@ -211,17 +361,17 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
 
-def _make_page_aligned_cuda_pool(
+def _make_page_aligned_gpu_pool(
     size: int,
     device: torch.device,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate a CUDA uint8 pool with a page-aligned visible view.
+    """Allocate a GPU uint8 pool with a page-aligned visible view.
 
     Args:
         size: Visible pool size in bytes.
-        device: CUDA device for allocation.
-        page_size: Host page size required by CUDA dmabuf export.
+        device: PyTorch CUDA/HIP device for allocation.
+        page_size: Host page size required by dmabuf export.
 
     Returns:
         ``(base_tensor, aligned_view)``. The base tensor keeps the owning
@@ -242,34 +392,37 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         device: str,
         block_align: int,
         exporter: str = "auto",
+        mem_range_flags: int = 0,
     ) -> None:
         """Initialize and export a GPU memory pool.
 
         Args:
             pool_bytes: Total GPU pool size in bytes.
-            device: CUDA device string, such as ``"cuda:0"``.
+            device: PyTorch CUDA/HIP device string, such as ``"cuda:0"``.
             block_align: O_DIRECT alignment in bytes.
-            exporter: Export strategy. First cut supports ``"auto"`` and
-                ``"cuda_pool"`` only.
+            exporter: Export strategy. First cut supports ``"auto"``,
+                ``"cuda_pool"``, and ``"hip"``.
+            mem_range_flags: Exporter-specific address-range flags.
 
         Raises:
             NotImplementedError: If a deferred exporter is requested.
-            RuntimeError: If CUDA allocation or DMA-BUF export fails.
+            RuntimeError: If GPU allocation or DMA-BUF export fails.
             ValueError: If pool geometry cannot satisfy dmabuf constraints.
         """
-        if exporter not in {"auto", "cuda_pool"}:
-            raise NotImplementedError(
-                "IouDmabufBackend first cut supports only exporter='auto' "
-                "or exporter='cuda_pool'"
+        resolved_exporter = _resolve_dmabuf_exporter(exporter)
+        torch_device = torch.device(device)
+        if torch_device.type != "cuda":
+            raise ValueError(
+                "IouDmabufBackend requires a PyTorch CUDA/HIP device"
             )
-        if not device.startswith("cuda"):
-            raise ValueError("IouDmabufBackend first cut requires a CUDA device")
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available for IouDmabufBackend")
+            raise RuntimeError("torch.cuda is not available for IouDmabufBackend")
         if pool_bytes <= 0:
             raise ValueError("pool_bytes must be > 0")
         if not _is_power_of_two(block_align):
             raise ValueError("block_align must be a positive power of two")
+        if mem_range_flags < 0:
+            raise ValueError("mem_range_flags must be >= 0")
 
         page_size = os.sysconf("SC_PAGESIZE")
         if pool_bytes % page_size != 0:
@@ -280,19 +433,21 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         self.pool_bytes = int(pool_bytes)
         self.block_align = int(block_align)
         self.slab_bytes = _SZ_1G
-        self.device = torch.device(device)
+        self.device = torch_device
+        self.exporter = resolved_exporter
+        self.mem_range_flags = int(mem_range_flags)
         self._closed = False
         self._boundary_guards: list[MemoryObj] = []
         self._lock = threading.Lock()
 
         with torch.cuda.device(self.device):
-            self._base_tensor, self.tensor = _make_page_aligned_cuda_pool(
+            self._base_tensor, self.tensor = _make_page_aligned_gpu_pool(
                 self.pool_bytes,
                 self.device,
                 page_size,
             )
         if self.tensor.data_ptr() % page_size != 0:
-            raise RuntimeError("CUDA pool pointer is not host-page aligned")
+            raise RuntimeError("GPU pool pointer is not host-page aligned")
 
         self._inner = TensorMemoryAllocator(
             self.tensor,
@@ -529,7 +684,7 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         return buf_offset + total_len <= self.slabs[slab_idx].size
 
     def _export_slabs(self, page_size: int) -> list[SlabDescriptor]:
-        cuda = _CudaDriver()
+        export_driver = self._make_export_driver()
         slabs: list[SlabDescriptor] = []
         base_ptr = int(self.tensor.data_ptr())
         try:
@@ -538,9 +693,13 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
                 device_ptr = base_ptr + slab_start
                 if device_ptr % page_size != 0 or slab_size % page_size != 0:
                     raise RuntimeError(
-                        "CUDA dmabuf export requires page-aligned pointer and size"
+                        "GPU dmabuf export requires page-aligned pointer and size"
                     )
-                dmabuf_fd = cuda.export_dmabuf(device_ptr, slab_size)
+                dmabuf_fd = export_driver.export_dmabuf(
+                    device_ptr,
+                    slab_size,
+                    self.mem_range_flags,
+                )
                 slabs.append(
                     SlabDescriptor(
                         device_ptr=device_ptr,
@@ -557,6 +716,13 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
                     pass
             raise
         return slabs
+
+    def _make_export_driver(self) -> _CudaDriver | _HipDriver:
+        if self.exporter == "cuda_pool":
+            return _CudaDriver()
+        if self.exporter == "hip":
+            return _HipDriver(_torch_cuda_device_index(self.device))
+        raise AssertionError(f"unexpected dmabuf exporter: {self.exporter}")
 
 
 class IouDmabufBackend(AllocatorBackendInterface):
@@ -1070,11 +1236,21 @@ class IouDmabufBackend(AllocatorBackendInterface):
             required=True,
             positive=True,
         )
+        mem_range_flags = _get_extra_int(
+            self.extra,
+            "iou_dmabuf.mem_range_flags",
+            0,
+        )
+        if mem_range_flags < 0:
+            raise ValueError(
+                "extra_config['iou_dmabuf.mem_range_flags'] must be >= 0"
+            )
         return DmabufGPUAllocator(
             pool_bytes=pool_bytes,
             device=self.dst_device,
             block_align=self.block_align,
             exporter=exporter,
+            mem_range_flags=mem_range_flags,
         )
 
     def get_memory_allocator(self) -> DmabufGPUAllocator:

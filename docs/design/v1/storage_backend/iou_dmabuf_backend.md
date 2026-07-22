@@ -194,8 +194,9 @@ needed is a P1 measurement (§8.1) — do not assume Approach A fails before tes
 
 ### 4.2 AMD path
 
-**Primary (ROCm 5.6+):** `hipMemGetHandleForAddressRange` mirrors the NVIDIA VMM
-path and is the first path to probe:
+**Primary (ROCm 5.6+):** the first implementation supports
+`hipMemGetHandleForAddressRange`, which mirrors the NVIDIA address-range export
+path:
 
 ```
 hipMalloc(&hip_ptr, slab_size)
@@ -209,7 +210,8 @@ hipMemGetHandleForAddressRange(
 ```
 
 **Fallback (older ROCm via DRM GEM):** If `hipMemGetHandleForAddressRange` is
-absent or returns an error, fall back to direct DRM GEM allocation:
+absent or returns an error, a later implementation can fall back to direct DRM
+GEM allocation:
 
 ```
 drm_fd = open("/dev/dri/renderD128", O_RDWR)
@@ -236,9 +238,9 @@ hipImportExternalMemory(&ext_mem, &ext_desc)
 hipExternalMemoryGetMappedBuffer(&hip_ptr, ext_mem, &buf_desc)
 ```
 
-The backend init code probes the HIP path first and falls back to DRM GEM only if
-it is unavailable. The DRM GEM path should not be treated as a first-class design
-concern until the HIP path is proven insufficient on a concrete target system.
+The backend init code currently supports the HIP path only. The DRM GEM path
+should not be treated as a first-class implementation concern until the HIP path
+is proven insufficient on a concrete target system.
 
 ### 4.3 Slab descriptor
 
@@ -1160,20 +1162,33 @@ extra_config:
   iou_dmabuf.slot_bytes: 16781312           # 16 MiB + header room
   iou_dmabuf.ring_depth: 256
   iou_dmabuf.max_eagain_retries: 16
-  iou_dmabuf.exporter: "auto"              # auto | cuda_pool | cuda_vmm | hip | amd_drm
+  iou_dmabuf.exporter: "auto"              # implemented: auto | cuda_pool | hip
+  iou_dmabuf.mem_range_flags: 0            # optional cuMem/hipMem export flags
   iou_dmabuf.require_p2p: false            # true = refuse init when P2P unverified
 ```
 
-`exporter: "auto"` probes in the order established by §8.1/§4.1:
+`exporter: "auto"` chooses `hip` on ROCm PyTorch (`torch.version.hip`) and
+`cuda_pool` otherwise. Deferred exporter names fail fast rather than silently
+falling back.
+
+Implemented exporters:
 
 1. **`cuda_pool`** (NVIDIA, preferred): export a 1 GiB sub-range of the
    `GPUMemoryAllocator` / PyTorch pool tensor via `cuMemGetHandleForAddressRange`
    (Approach A; may need `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`).
-2. **`cuda_vmm`** (NVIDIA fallback): dedicated VMM allocation
-   (`cuMemCreate`/`cuMemMap`) + `torch.from_blob` wrapping (Approach B), used only if
-   the pool export in (1) fails on the target driver.
-3. **`hip`** (AMD): `hipMemGetHandleForAddressRange`.
-4. **`amd_drm`** (AMD fallback): DRM GEM allocation + import.
+2. **`hip`** (AMD): export a PyTorch ROCm pool range with
+   `hipMemGetHandleForAddressRange`.
+
+Deferred exporters:
+
+1. **`cuda_vmm`** (NVIDIA fallback): dedicated VMM allocation
+   (`cuMemCreate`/`cuMemMap`) + `torch.from_blob` wrapping, used only if
+   `cuda_pool` fails on the target driver.
+2. **`amd_drm`** (AMD fallback): DRM GEM allocation + import.
+
+`iou_dmabuf.mem_range_flags` is passed directly to the CUDA/HIP address-range
+export call. Keep it `0` first; on AMD, try the HIP PCIe mapping flag only if the
+default export fails on the target driver.
 
 ---
 
@@ -1327,5 +1342,5 @@ AMD, and tuning — none of which block basic correctness.
 | P1    | GPU pool allocation reusing `GPUMemoryAllocator` (NVIDIA); dmabuf **export** proven (§8.1) | **`cuMemGetHandleForAddressRange` exports a 1 GiB sub-range of the pool tensor** (record any `PYTORCH_CUDA_ALLOC_CONF` needed); exported fd registers and a round-trip READ_FIXED/WRITE_FIXED verifies on GPU. **P2 must not begin until this passes.** |
 | P2    | New `RawBlockCore` methods (`get_entries_many`, `reserve_slot`, `write_slot_header`, `commit_slot`, `abort_slot`); `DmabufGPUAllocator` + full `AllocatorBackendInterface` surface (§11/M4); full §10 write dispatch — direct GPU-source `WRITE_FIXED` + **CPU-source `put_many` fallback** + **foreign-GPU rejection**; read path (§9) **including the `lock_refcount=True` / `unlock_many` lock lifetime** (intrinsic to a correct read — unlocked reads race eviction, not optional) | Normal `StorageManager` put/get works end-to-end (CPU-allocated source stores via fallback; a registered-GPU source stores via `WRITE_FIXED`) on real NVMe + GPU, `location="IouDmabufBackend"`; O_DIRECT length rounding (C1) verified with a non-4K-multiple chunk; foreign GPU source rejected (not corrupted); a read holding a slot survives a concurrent `delete_many`/eviction |
 | P3    | P2P diagnostics (§13) | P2P status logged at startup |
-| P4    | AMD HIP address-range export path; AMD DRM GEM fallback                       | AMD GPU smoke test passes                         |
+| P4    | AMD HIP address-range export path; AMD DRM GEM fallback remains deferred until needed | AMD GPU smoke test passes                         |
 | P5    | Metrics counters; `require_p2p` enforcement; default-traversal promotion; batched async get | Perf benchmark vs `GdsBackend`; production readiness review |

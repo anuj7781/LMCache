@@ -21,6 +21,7 @@ use pyo3::types::PyAny;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -189,6 +190,45 @@ const O_DIRECT: i32 = libc::O_DIRECT;
 #[cfg(not(target_os = "linux"))]
 const O_DIRECT: i32 = 0;
 const RING_SIZE: usize = 256;
+const IORING_REGISTER_BUFFERS2: u32 = 15;
+const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
+const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
+const IORING_RSRC_UPDATE_EXTENDED: u32 = 1 << 1;
+const IO_REGBUF_TYPE_DMABUF: u32 = 2;
+const DEFAULT_DMABUF_EAGAIN_RETRIES: usize = 16;
+
+#[repr(C)]
+#[derive(Default)]
+struct IoUringRsrcRegister {
+    nr: u32,
+    flags: u32,
+    resv2: u64,
+    data: u64,
+    tags: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoUringRsrcUpdate2 {
+    offset: u32,
+    flags: u32,
+    data: u64,
+    tags: u64,
+    nr: u32,
+    resv2: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoUringRegbufDesc {
+    type_: u32,
+    flags: u32,
+    size: u64,
+    uaddr: u64,
+    dmabuf_fd: i32,
+    target_fd: i32,
+    resv: [u64; 6],
+}
 
 fn parse_use_iouring(io_engine: Option<String>, use_iouring: bool) -> PyResult<bool> {
     match io_engine {
@@ -229,6 +269,99 @@ fn errno() -> i32 {
 // Convert errno to a Python OSError with a message.
 fn os_err(msg: &str) -> PyErr {
     PyOSError::new_err((errno(), msg.to_string()))
+}
+
+fn raw_os_error(msg: &str, code: i32) -> PyErr {
+    PyOSError::new_err((code, msg.to_string()))
+}
+
+fn io_uring_register_raw(
+    ring_fd: RawFd,
+    opcode: u32,
+    arg: *const libc::c_void,
+    nr_args: u32,
+) -> Result<i32, i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let ret =
+            unsafe { libc::syscall(libc::SYS_io_uring_register, ring_fd, opcode, arg, nr_args) };
+        if ret < 0 {
+            Err(errno())
+        } else {
+            Ok(ret as i32)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ring_fd, opcode, arg, nr_args);
+        Err(libc::ENOSYS)
+    }
+}
+
+fn ring_raw_fd(ring: &IoUringWrapper) -> RawFd {
+    match ring {
+        IoUringWrapper::Standard(ring) => {
+            let ring = ring.lock().unwrap();
+            ring.as_raw_fd()
+        }
+        IoUringWrapper::Big(ring) => {
+            let ring = ring.lock().unwrap();
+            ring.as_raw_fd()
+        }
+    }
+}
+
+fn register_sparse_buffer_table(ring_fd: RawFd, nr: u32) -> PyResult<()> {
+    let reg = IoUringRsrcRegister {
+        nr,
+        flags: IORING_RSRC_REGISTER_SPARSE,
+        ..Default::default()
+    };
+    match io_uring_register_raw(
+        ring_fd,
+        IORING_REGISTER_BUFFERS2,
+        &reg as *const _ as *const libc::c_void,
+        std::mem::size_of::<IoUringRsrcRegister>() as u32,
+    ) {
+        Ok(_) => Ok(()),
+        Err(code) => Err(raw_os_error(
+            "io_uring sparse buffer registration failed",
+            code,
+        )),
+    }
+}
+
+fn register_dmabuf_slot(
+    ring_fd: RawFd,
+    slot: u32,
+    target_fd: RawFd,
+    dmabuf_fd: RawFd,
+) -> PyResult<()> {
+    let desc = IoUringRegbufDesc {
+        type_: IO_REGBUF_TYPE_DMABUF,
+        dmabuf_fd,
+        target_fd,
+        ..Default::default()
+    };
+    let update = IoUringRsrcUpdate2 {
+        offset: slot,
+        flags: IORING_RSRC_UPDATE_EXTENDED,
+        data: (&desc as *const IoUringRegbufDesc) as u64,
+        nr: 1,
+        ..Default::default()
+    };
+    match io_uring_register_raw(
+        ring_fd,
+        IORING_REGISTER_BUFFERS_UPDATE,
+        &update as *const _ as *const libc::c_void,
+        std::mem::size_of::<IoUringRsrcUpdate2>() as u32,
+    ) {
+        Ok(1) => Ok(()),
+        Ok(ret) => Err(PyRuntimeError::new_err(format!(
+            "io_uring dmabuf registration updated {ret} slots, expected 1"
+        ))),
+        Err(code) => Err(raw_os_error("io_uring dmabuf registration failed", code)),
+    }
 }
 
 // Low-level write loop that retries until all bytes are written.
@@ -847,6 +980,8 @@ struct IoSubmission {
     payload_len: Option<usize>,         // For bounce buffer reads
     batch_id: u64,                      // Batch ID for per-batch tracking
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
+    is_dmabuf: bool,
+    eagain_retries_left: usize,
 }
 
 impl Default for IoSubmission {
@@ -864,6 +999,8 @@ impl Default for IoSubmission {
             payload_len: None,
             batch_id: 0,
             nvme_cmd_data: None,
+            is_dmabuf: false,
+            eagain_retries_left: 0,
         }
     }
 }
@@ -1177,7 +1314,13 @@ impl RawBlockDevice {
                     // Regular io_uring read/write
                     let bytes_transferred = cqe_result as usize;
                     if bytes_transferred < sub.len {
-                        if is_shutdown {
+                        if sub.is_dmabuf {
+                            let _ = sub.bounce.take();
+                            Err(PyOSError::new_err((
+                                libc::EIO,
+                                "short io_uring dmabuf I/O".to_string(),
+                            )))
+                        } else if is_shutdown {
                             // Short read/write during shutdown: fail the request
                             let _ = sub.bounce.take();
                             Err(PyRuntimeError::new_err(
@@ -1374,10 +1517,32 @@ impl RawBlockDevice {
                                         let batch_id = sub.batch_id;
                                         let cqe_result = cqe.result();
 
+                                        if sub.is_dmabuf
+                                            && cqe_result == -libc::EAGAIN
+                                            && sub.eagain_retries_left > 0
+                                        {
+                                            sub.eagain_retries_left -= 1;
+                                            in_flight.insert(user_data, sub.clone());
+                                            let _ =
+                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
+                                            let _ = match &ring_clone {
+                                                IoUringWrapper::Standard(ring) => {
+                                                    let ring = ring.lock().unwrap();
+                                                    ring.submitter().submit()
+                                                }
+                                                IoUringWrapper::Big(ring) => {
+                                                    let ring = ring.lock().unwrap();
+                                                    ring.submitter().submit()
+                                                }
+                                            };
+                                            continue;
+                                        }
+
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
                                         if cqe_result >= 0
                                             && (cqe_result as usize) < sub.len
                                             && sub.nvme_cmd_data.is_none()
+                                            && !sub.is_dmabuf
                                         {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
@@ -1455,10 +1620,32 @@ impl RawBlockDevice {
                                         let batch_id = sub.batch_id;
                                         let cqe_result = cqe.result();
 
+                                        if sub.is_dmabuf
+                                            && cqe_result == -libc::EAGAIN
+                                            && sub.eagain_retries_left > 0
+                                        {
+                                            sub.eagain_retries_left -= 1;
+                                            in_flight.insert(user_data, sub.clone());
+                                            let _ =
+                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
+                                            let _ = match &ring_clone {
+                                                IoUringWrapper::Standard(ring) => {
+                                                    let ring = ring.lock().unwrap();
+                                                    ring.submitter().submit()
+                                                }
+                                                IoUringWrapper::Big(ring) => {
+                                                    let ring = ring.lock().unwrap();
+                                                    ring.submitter().submit()
+                                                }
+                                            };
+                                            continue;
+                                        }
+
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
                                         if cqe_result >= 0
                                             && (cqe_result as usize) < sub.len
                                             && sub.nvme_cmd_data.is_none()
+                                            && !sub.is_dmabuf
                                         {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
@@ -1824,6 +2011,85 @@ impl RawBlockDevice {
             dspec,
         }))
     }
+
+    fn submit_dmabuf_fixed_io(
+        &self,
+        py: Python<'_>,
+        is_write: bool,
+        slab_idx: u32,
+        dmabuf_offset: u64,
+        length: usize,
+        device_offset: u64,
+        max_eagain_retries: usize,
+    ) -> PyResult<usize> {
+        if !self.use_iouring {
+            return Err(PyRuntimeError::new_err("io_uring not enabled"));
+        }
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("device is closed"));
+        }
+        if !self.fixed_buffers_registered.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("dmabuf buffers are not registered"));
+        }
+        if slab_idx > u16::MAX as u32 {
+            return Err(PyValueError::new_err(
+                "slab_idx exceeds io_uring buf_index range",
+            ));
+        }
+        if length == 0 {
+            return Err(PyValueError::new_err("length must be non-zero"));
+        }
+        if length > u32::MAX as usize {
+            return Err(PyValueError::new_err("length exceeds io_uring u32 limit"));
+        }
+        if self.use_odirect {
+            #[allow(clippy::manual_is_multiple_of)]
+            if (device_offset as usize) % self.alignment != 0 {
+                return Err(PyValueError::new_err(
+                    "O_DIRECT requires aligned device_offset",
+                ));
+            }
+            #[allow(clippy::manual_is_multiple_of)]
+            if (dmabuf_offset as usize) % self.alignment != 0 {
+                return Err(PyValueError::new_err(
+                    "O_DIRECT requires aligned dmabuf_offset",
+                ));
+            }
+            #[allow(clippy::manual_is_multiple_of)]
+            if length % self.alignment != 0 {
+                return Err(PyValueError::new_err("O_DIRECT requires aligned length"));
+            }
+        }
+
+        self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        let comp = Arc::new(IoCompletion::new());
+        let sub = IoSubmission {
+            fd: self.fd,
+            offset: device_offset,
+            len: length,
+            ptr_addr: dmabuf_offset as usize,
+            is_write,
+            completion: comp.clone(),
+            fixed_buffer_idx: Some(slab_idx as u16),
+            bounce: None,
+            original_ptr: None,
+            payload_len: None,
+            batch_id: 0,
+            nvme_cmd_data: None,
+            is_dmabuf: true,
+            eagain_retries_left: max_eagain_retries,
+        };
+        {
+            let q = self.queue.as_ref().expect("queue must exist");
+            let mut q = q.lock().unwrap();
+            q.push(sub);
+        }
+        if let Some(batch_ready) = &self.batch_ready {
+            batch_ready.signal_producer();
+        }
+        py.allow_threads(move || comp.wait())?;
+        Ok(length)
+    }
 }
 
 #[pymethods]
@@ -1888,6 +2154,138 @@ impl RawBlockDevice {
         self.nvme_lba_size.ok_or_else(|| {
             PyRuntimeError::new_err("NVMe LBA size not available (use_uring_cmd not enabled)")
         })
+    }
+
+    /// Probe whether the running kernel recognizes IO_REGBUF_TYPE_DMABUF.
+    #[staticmethod]
+    fn probe_dmabuf_support() -> PyResult<bool> {
+        let ring = IoUring::<SqueueEntry, Entry>::builder()
+            .build(1)
+            .map_err(|e| PyRuntimeError::new_err(format!("io_uring init failed: {}", e)))?;
+        let ring_fd = ring.as_raw_fd();
+        if register_sparse_buffer_table(ring_fd, 1).is_err() {
+            return Ok(false);
+        }
+        let desc = IoUringRegbufDesc {
+            type_: IO_REGBUF_TYPE_DMABUF,
+            dmabuf_fd: -1,
+            target_fd: -1,
+            ..Default::default()
+        };
+        let update = IoUringRsrcUpdate2 {
+            flags: IORING_RSRC_UPDATE_EXTENDED,
+            data: (&desc as *const IoUringRegbufDesc) as u64,
+            nr: 1,
+            ..Default::default()
+        };
+        match io_uring_register_raw(
+            ring_fd,
+            IORING_REGISTER_BUFFERS_UPDATE,
+            &update as *const _ as *const libc::c_void,
+            std::mem::size_of::<IoUringRsrcUpdate2>() as u32,
+        ) {
+            Ok(_) => Ok(true),
+            Err(libc::EBADF) => Ok(true),
+            Err(libc::EOPNOTSUPP) | Err(libc::EINVAL) => Ok(false),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Register dmabuf file descriptors in the ring's sparse buffer table.
+    #[pyo3(signature = (dmabuf_fds))]
+    fn register_dmabuf_buffers(&self, dmabuf_fds: Vec<i32>) -> PyResult<()> {
+        if !self.use_iouring {
+            return Err(PyRuntimeError::new_err("io_uring not enabled"));
+        }
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("device is closed"));
+        }
+        if dmabuf_fds.is_empty() {
+            return Err(PyValueError::new_err(
+                "at least one dmabuf fd must be provided",
+            ));
+        }
+        if dmabuf_fds.len() > u16::MAX as usize {
+            return Err(PyValueError::new_err(
+                "too many dmabuf fds for io_uring buf_index",
+            ));
+        }
+        if self.fixed_buffers_registered.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "io_uring buffers are already registered",
+            ));
+        }
+        if dmabuf_fds.iter().any(|fd| *fd < 0) {
+            return Err(PyValueError::new_err("dmabuf fds must be non-negative"));
+        }
+
+        let ring = self
+            .ring
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("io_uring ring is not initialized"))?;
+        let ring_fd = ring_raw_fd(ring);
+        register_sparse_buffer_table(ring_fd, dmabuf_fds.len() as u32)?;
+        for (idx, dmabuf_fd) in dmabuf_fds.iter().enumerate() {
+            register_dmabuf_slot(ring_fd, idx as u32, self.fd, *dmabuf_fd)?;
+        }
+        self.fixed_buffers_registered.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Read from the raw device into a registered dmabuf fixed-buffer slot.
+    #[pyo3(signature = (
+        slab_idx,
+        dmabuf_offset,
+        length,
+        device_offset,
+        max_eagain_retries = DEFAULT_DMABUF_EAGAIN_RETRIES
+    ))]
+    fn read_fixed_dmabuf(
+        &self,
+        py: Python<'_>,
+        slab_idx: u32,
+        dmabuf_offset: u64,
+        length: usize,
+        device_offset: u64,
+        max_eagain_retries: usize,
+    ) -> PyResult<usize> {
+        self.submit_dmabuf_fixed_io(
+            py,
+            false,
+            slab_idx,
+            dmabuf_offset,
+            length,
+            device_offset,
+            max_eagain_retries,
+        )
+    }
+
+    /// Write from a registered dmabuf fixed-buffer slot into the raw device.
+    #[pyo3(signature = (
+        slab_idx,
+        dmabuf_offset,
+        length,
+        device_offset,
+        max_eagain_retries = DEFAULT_DMABUF_EAGAIN_RETRIES
+    ))]
+    fn write_fixed_dmabuf(
+        &self,
+        py: Python<'_>,
+        slab_idx: u32,
+        dmabuf_offset: u64,
+        length: usize,
+        device_offset: u64,
+        max_eagain_retries: usize,
+    ) -> PyResult<usize> {
+        self.submit_dmabuf_fixed_io(
+            py,
+            true,
+            slab_idx,
+            dmabuf_offset,
+            length,
+            device_offset,
+            max_eagain_retries,
+        )
     }
 
     /// Register fixed buffers for zero-copy io_uring operations.
@@ -2136,6 +2534,8 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data,
+                    is_dmabuf: false,
+                    eagain_retries_left: 0,
                 };
 
                 submissions.push((sub, comp));
@@ -2371,6 +2771,8 @@ impl RawBlockDevice {
                 payload_len: None,
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                is_dmabuf: false,
+                eagain_retries_left: 0,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2400,6 +2802,8 @@ impl RawBlockDevice {
                 payload_len: Some(payload_len),
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                is_dmabuf: false,
+                eagain_retries_left: 0,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2506,6 +2910,8 @@ impl RawBlockDevice {
                 payload_len: None,
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                is_dmabuf: false,
+                eagain_retries_left: 0,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2539,6 +2945,8 @@ impl RawBlockDevice {
                 payload_len: Some(payload_len),
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                is_dmabuf: false,
+                eagain_retries_left: 0,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2715,6 +3123,8 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
+                    is_dmabuf: false,
+                    eagain_retries_left: 0,
                 };
 
                 submissions.push((sub, comp));

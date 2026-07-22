@@ -319,8 +319,12 @@ class StorageManager:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
             else:
                 allocator_backend = self.storage_backends["MaruBackend"]
-        else:
+        elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
+        elif "IouDmabufBackend" in self.storage_backends:
+            allocator_backend = self.storage_backends["IouDmabufBackend"]
+        else:
+            raise RuntimeError("No allocator backend is available")
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 

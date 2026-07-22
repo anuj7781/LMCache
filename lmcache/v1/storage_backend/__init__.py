@@ -12,6 +12,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
+from lmcache.v1.storage_backend.iou_dmabuf_backend import IouDmabufBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
@@ -128,6 +129,26 @@ def CreateStorageBackends(
     enable_nixl_storage = extra_config is not None and extra_config.get(
         "enable_nixl_storage"
     )
+    enable_iou_dmabuf = extra_config is not None and extra_config.get(
+        "iou_dmabuf.enabled", False
+    )
+    if enable_iou_dmabuf and "IouDmabufBackend" not in _skip:
+        if (
+            config.local_disk
+            and config.max_local_disk_size > 0
+            and "LocalDiskBackend" not in _skip
+        ):
+            raise ValueError(
+                "iou_dmabuf.enabled=true cannot be used with LocalDiskBackend "
+                "in the first cut; disable local_disk or pass "
+                "skip_backends={'LocalDiskBackend'}"
+            )
+        if config.gds_path is not None and "GdsBackend" not in _skip:
+            raise ValueError(
+                "iou_dmabuf.enabled=true cannot be used with GdsBackend "
+                "in the first cut; unset gds_path or pass "
+                "skip_backends={'GdsBackend'}"
+            )
 
     if config.enable_pd and "PDBackend" not in _skip:
         # First Party
@@ -240,6 +261,17 @@ def CreateStorageBackends(
             dst_device,
         )
         storage_backends[str(gds_backend)] = gds_backend
+
+    if enable_iou_dmabuf and "IouDmabufBackend" not in _skip:
+        if IouDmabufBackend.is_available():
+            iou_backend = IouDmabufBackend(config, metadata, loop, dst_device)
+            storage_backends[str(iou_backend)] = iou_backend
+        else:
+            logger.warning(
+                "iou_dmabuf.enabled=true but lmcache_rust_raw_block_io is "
+                "missing/outdated or the kernel lacks CONFIG_DMABUF_TOKEN; "
+                "skipping IouDmabufBackend"
+            )
 
     if config.maru_path is not None and "MaruBackend" not in _skip:
         try:

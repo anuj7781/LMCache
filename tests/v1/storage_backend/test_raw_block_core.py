@@ -255,6 +255,12 @@ def test_raw_block_core_commit_recycles_canceled_inflight_slot(tmp_path):
         assert core.commit_slot(first, offset) is False
         assert core.contains_key(first.encoded) is False
 
+        # A writer's finally-block aborts unconditionally; after a canceled
+        # commit already freed the slot this must be a benign no-op, not a
+        # double-free. The slot is recycled exactly once, proven by ``second``
+        # reusing the same offset below.
+        core.abort_slot(first, offset)
+
         reused = core.reserve_slot(second, obj)
         assert reused == offset
         core.abort_slot(second, reused)

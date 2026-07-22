@@ -792,6 +792,12 @@ class RawBlockCore:
     def abort_slot(self, key: RawBlockKeySpec, offset: int) -> None:
         """Abort an in-flight raw-block reservation and recycle its slot.
 
+        Safe to call unconditionally from a writer's cleanup path. If the
+        reservation was already resolved -- committed, or freed by a
+        ``commit_slot`` that observed a concurrent ``delete_many`` cancel --
+        there is nothing in-flight and this is a benign no-op. Only an offset
+        that contradicts a still-live reservation is an inconsistency.
+
         Args:
             key: Raw-block key spec whose reservation should be aborted.
             offset: Reserved slot base offset returned by ``reserve_slot``.
@@ -799,13 +805,15 @@ class RawBlockCore:
         with self._lock:
             inflight = self._inflight.get(key.encoded)
             if inflight is None:
-                logger.error(
-                    "RawBlockCore abort for %s without in-flight reservation",
+                # Already committed or canceled-and-freed by commit_slot; the
+                # writer's finally-block abort races that resolution normally.
+                logger.debug(
+                    "RawBlockCore abort for %s: reservation already resolved",
                     key.encoded,
                 )
                 return
             if int(inflight.offset) != int(offset):
-                logger.error(
+                logger.warning(
                     "RawBlockCore abort offset mismatch for %s: %s != %s",
                     key.encoded,
                     inflight.offset,

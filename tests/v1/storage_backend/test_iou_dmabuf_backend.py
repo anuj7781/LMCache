@@ -7,6 +7,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, Optional
 import asyncio
+import os
 import sys
 import types
 
@@ -498,3 +499,64 @@ def test_create_storage_backends_rejects_overlapping_local_disk() -> None:
 
     with pytest.raises(ValueError, match="LocalDiskBackend"):
         CreateStorageBackends(config, _make_metadata(), asyncio.new_event_loop())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="DmabufGPUAllocator requires a CUDA device",
+)
+def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A block-rounded dmabuf transfer must stay inside its own allocation.
+
+    The dmabuf read/write length is ``round_up(payload, block_align)``
+    (``total_len``), which is larger than the logical payload for a
+    non-block-multiple chunk. This verifies the pool allocator reserves the
+    rounded size, so a ``total_len`` transfer into one allocation cannot
+    corrupt the physically adjacent allocation.
+    """
+    # First Party
+    from lmcache.v1.storage_backend import iou_dmabuf_backend as mod
+
+    # Avoid the libcuda dependency: hand back closeable fds instead of
+    # exporting real DMA-BUFs. The pool tensor itself is still real CUDA memory.
+    class _FakeCudaDriver:
+        def export_dmabuf(self, device_ptr: int, size: int) -> int:
+            return os.open(os.devnull, os.O_RDONLY)
+
+    monkeypatch.setattr(mod, "_CudaDriver", _FakeCudaDriver)
+
+    block_align = 4096
+    allocator = mod.DmabufGPUAllocator(
+        pool_bytes=1 << 21,  # 2 MiB, one slab, page-aligned
+        device="cuda:0",
+        block_align=block_align,
+        exporter="cuda_pool",
+    )
+    try:
+        # 4097 bytes -> rounds up to 8192, so total_len > payload.
+        shape = torch.Size([block_align + 1])
+        first = allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY)
+        second = allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY)
+        assert first is not None and second is not None
+
+        addr_first = int(first.metadata.address)
+        addr_second = int(second.metadata.address)
+        total_len_first = allocator.transfer_len(first)
+        assert total_len_first > first.get_size()
+
+        # The neighbor must begin at or beyond the rounded end of the first
+        # allocation, so writing total_len bytes cannot reach it.
+        assert addr_second >= addr_first + total_len_first
+
+        pool = allocator.tensor
+        neighbor_len = second.get_size()
+        pool[addr_second : addr_second + neighbor_len].fill_(0)
+        # Simulate the dmabuf read filling the full rounded transfer region.
+        pool[addr_first : addr_first + total_len_first].fill_(0xFF)
+        torch.cuda.synchronize()
+
+        assert int(pool[addr_second : addr_second + neighbor_len].max().item()) == 0
+    finally:
+        allocator.close()

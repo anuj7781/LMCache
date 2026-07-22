@@ -1095,7 +1095,10 @@ if (
     and "IouDmabufBackend" not in _skip
 ):
     # First cut: hard-require a LocalCPUBackend staging allocator (see below).
-    if "LocalCPUBackend" not in storage_backends:
+    # Check the local_cpu_backend variable, not the new storage_backends dict:
+    # on /conf recreation an existing LocalCPUBackend is reused (into
+    # local_cpu_backend) but not re-added to the dict when it is skipped.
+    if local_cpu_backend is None:
         raise ValueError(
             "iou_dmabuf.enabled=true requires a LocalCPUBackend staging "
             "allocator; set max_local_cpu_size > 0"
@@ -1122,7 +1125,11 @@ Rather than rely on traversal order or ad-hoc `location=` addressing, the first 
 them) raises a `ValueError` in `CreateStorageBackends`. Operators must disable the
 overlapping disk backend, so `IouDmabufBackend` is the only local-NVMe backend in
 `storage_backends`. (`location="IouDmabufBackend"` still works for explicit reads,
-but is not required and is not the sanctioned way to resolve overlap.)
+but is not required and is not the sanctioned way to resolve overlap.) The rejection
+is evaluated against the **effective** backend set — already-existing plus
+being-created — so it fires in both directions of dynamic `/conf` recreation (adding
+`IouDmabufBackend` while a disk backend exists, and adding a disk backend while
+`IouDmabufBackend` exists), not only on cold creation.
 
 **Staging-allocator requirement.** `IouDmabufBackend` is never the *global* allocator
 in the first cut: it requires a `LocalCPUBackend` (`max_local_cpu_size > 0`), enforced

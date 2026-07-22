@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 # Standard
+from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import MagicMock
 import asyncio
 import os
 import sys
@@ -599,6 +602,110 @@ def test_create_storage_backends_requires_local_cpu_staging() -> None:
 
     with pytest.raises(ValueError, match="LocalCPUBackend"):
         CreateStorageBackends(config, _make_metadata(), asyncio.new_event_loop())
+
+
+def test_create_storage_backends_rejects_adding_local_disk_when_iou_exists() -> None:
+    # Dynamic recreation: IouDmabufBackend already exists and is skipped, while
+    # LocalDiskBackend is being added. Strict overlap rejection must still fire
+    # even though Iou is not being (re)created in this call.
+    config = LMCacheEngineConfig.from_defaults(
+        local_cpu=False,
+        max_local_cpu_size=0,
+        local_disk="/tmp/lmcache",
+        max_local_disk_size=1,
+        extra_config=_make_config().extra_config,
+    )
+    existing: OrderedDict[str, object] = OrderedDict()
+    existing["IouDmabufBackend"] = object()  # sentinel; only membership is read
+
+    with pytest.raises(ValueError, match="LocalDiskBackend"):
+        CreateStorageBackends(
+            config,
+            _make_metadata(),
+            asyncio.new_event_loop(),
+            skip_backends={"IouDmabufBackend"},
+            existing_backends=existing,  # type: ignore[arg-type]
+        )
+
+
+def test_create_storage_backends_iou_accepts_reused_local_cpu(
+    patched_backend: None,
+) -> None:
+    # A LocalCPUBackend that already exists is reused (not re-added to the new
+    # dict) when skipped. The staging guard must accept it via the reused
+    # instance rather than dict membership.
+    # First Party
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+    config = LMCacheEngineConfig.from_defaults(
+        local_cpu=False,
+        max_local_cpu_size=0,  # no new LocalCPUBackend is created
+        extra_config=_make_config().extra_config,
+    )
+    existing: OrderedDict[str, object] = OrderedDict()
+    existing["LocalCPUBackend"] = MagicMock(spec=LocalCPUBackend)
+
+    backends = CreateStorageBackends(
+        config,
+        _make_metadata(),
+        asyncio.new_event_loop(),
+        skip_backends={"LocalCPUBackend"},
+        existing_backends=existing,  # type: ignore[arg-type]
+    )
+    assert "IouDmabufBackend" in backends
+
+
+def test_allocate_and_copy_objects_skips_present_keys_without_misaligning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A key already present in the target allocator is skipped; the returned
+    # keys must be the actual keys copied, not a count-based prefix of the input
+    # (which would mislabel later objects and silently drop a key downstream).
+    # First Party
+    from lmcache.v1.storage_backend import storage_manager as sm
+
+    # Neutralize the device-stream context so the copy runs on plain CPU tensors.
+    monkeypatch.setattr(
+        sm,
+        "torch_dev",
+        SimpleNamespace(stream=lambda stream: nullcontext()),
+    )
+
+    present_key = _make_key(1)
+    absent_key = _make_key(2)
+    src_present = _make_memory_obj(4)
+    src_absent = _make_memory_obj(4)
+
+    class _StagingAllocator:
+        def __init__(self) -> None:
+            self.made: list[MemoryObj] = []
+
+        def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+            return key.to_string() == present_key.to_string()
+
+        def allocate(
+            self,
+            shape: torch.Size,
+            dtype: torch.dtype,
+            fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+            eviction: bool = True,
+            busy_loop: bool = True,
+        ) -> MemoryObj:
+            obj = _make_memory_obj(4)
+            self.made.append(obj)
+            return obj
+
+    allocator = _StagingAllocator()
+    keys, objs = sm.allocate_and_copy_objects(
+        allocator,
+        [present_key, absent_key],
+        [src_present, src_absent],
+        stream=None,
+    )
+
+    assert [key.to_string() for key in keys] == [absent_key.to_string()]
+    assert len(objs) == 1
+    assert objs[0] is allocator.made[0]
 
 
 @pytest.mark.skipif(

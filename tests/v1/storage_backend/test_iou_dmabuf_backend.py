@@ -11,6 +11,7 @@ from typing import Any, Optional
 from unittest.mock import MagicMock
 import asyncio
 import ctypes
+import logging
 import os
 import sys
 import types
@@ -496,7 +497,16 @@ def test_iou_dmabuf_owned_gpu_no_slot_does_not_report_success(
 
 def test_iou_dmabuf_rejects_foreign_gpu_source(
     patched_backend: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Rejecting a foreign GPU source logs an expected warning. Raise the
+    # backend logger above WARNING for this test so the expected message does
+    # not clutter output; the rejection itself is verified by the state
+    # assertions below (nothing reserved, written, or stored).
+    caplog.set_level(
+        logging.ERROR,
+        logger="lmcache.v1.storage_backend.iou_dmabuf_backend",
+    )
     backend = IouDmabufBackend(
         _make_config(),
         _make_metadata(),

@@ -951,6 +951,8 @@ def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
         block_align=block_align,
         exporter="cuda_pool",
     )
+    first: Optional[MemoryObj] = None
+    second: Optional[MemoryObj] = None
     try:
         # 4097 bytes -> rounds up to 8192, so total_len > payload.
         shape = torch.Size([block_align + 1])
@@ -976,4 +978,11 @@ def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
 
         assert int(pool[addr_second : addr_second + neighbor_len].max().item()) == 0
     finally:
+        # Release both allocations before closing so they are not GC'd with a
+        # live ref_count (which logs "garbage collected with ref_count=1").
+        # These are the addr 0 / addr 8192 objects seen in the test logs.
+        if first is not None:
+            first.ref_count_down()
+        if second is not None:
+            second.ref_count_down()
         allocator.close()

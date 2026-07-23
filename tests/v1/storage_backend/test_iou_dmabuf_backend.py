@@ -446,6 +446,9 @@ def test_iou_dmabuf_owned_gpu_source_uses_write_fixed_dmabuf(
         assert completed == [key]
         assert source.get_ref_count() == 1
     finally:
+        # Release the allocator-owned source so it is not GC'd with a live
+        # ref_count and log a leak warning (addr 4096 in the test logs).
+        source.ref_count_down()
         backend.close()
 
 
@@ -485,6 +488,9 @@ def test_iou_dmabuf_owned_gpu_no_slot_does_not_report_success(
         assert core.rawdev.writes == []
         assert source.get_ref_count() == 1
     finally:
+        # Release the allocator-owned source so it is not GC'd with a live
+        # ref_count and log a leak warning (addr 4096 in the test logs).
+        source.ref_count_down()
         backend.close()
 
 

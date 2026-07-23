@@ -192,14 +192,19 @@ class _FakeAllocator:
         allocator_type: Optional[str] = None,
     ) -> Optional[MemoryObj]:
         del allocator_type
-        obj = _make_memory_obj(
-            7,
+        shape = shapes if isinstance(shapes, torch.Size) else shapes[0]
+        dtype = dtypes if isinstance(dtypes, torch.dtype) else dtypes[0]
+        # Build a shape-consistent object (raw_data sized to shape * dtype) so
+        # get_size() and `.tensor` derive from the real layout, mirroring a real
+        # allocator. A hardcoded mismatched size would only appear correct when
+        # masked by set_used_size(), which the read path must NOT call.
+        obj = _make_shaped_memory_obj(
+            shape,
+            dtype,
             parent_allocator=self,
             address=self._next_address,
             fmt=fmt,
         )
-        obj.meta.shape = shapes if isinstance(shapes, torch.Size) else shapes[0]
-        obj.meta.dtype = dtypes if isinstance(dtypes, torch.dtype) else dtypes[0]
         self._next_address += 4096
         self.allocated.append(obj)
         return obj
@@ -310,6 +315,37 @@ def _make_memory_obj(
         ref_count=1,
         pin_count=0,
         fmt=fmt,
+    )
+    return TensorMemoryObj(raw_data, metadata, parent_allocator=parent_allocator)
+
+
+def _make_shaped_memory_obj(
+    shape: torch.Size,
+    dtype: torch.dtype,
+    *,
+    parent_allocator: object | None = None,
+    address: int = 0,
+    fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+) -> TensorMemoryObj:
+    """Build a TensorMemoryObj whose raw buffer matches ``shape``/``dtype``.
+
+    Unlike ``_make_memory_obj`` (a flat uint8 buffer), this keeps the layout
+    self-consistent so ``get_size()`` and ``.tensor`` derive from the real KV
+    shape, which is the shape a retrieved object must expose to the GPU
+    connector.
+    """
+    nbytes = int(shape.numel()) * torch.empty(0, dtype=dtype).element_size()
+    raw_data = torch.zeros(nbytes, dtype=torch.uint8)
+    metadata = MemoryObjMetadata(
+        shape=shape,
+        dtype=dtype,
+        address=address,
+        phy_size=((nbytes + 4095) // 4096) * 4096,
+        ref_count=1,
+        pin_count=0,
+        fmt=fmt,
+        shapes=[shape],
+        dtypes=[dtype],
     )
     return TensorMemoryObj(raw_data, metadata, parent_allocator=parent_allocator)
 
@@ -516,6 +552,53 @@ def test_iou_dmabuf_read_locks_until_io_finishes(
         assert results[0].get_size() == 3
         assert core.rawdev.reads == [(0, 0, 4096, 12288, 16)]
         assert core.unlocked == [[encoded]]
+    finally:
+        backend.close()
+
+
+def test_iou_dmabuf_read_returns_reshaped_kv_tensor(
+    patched_backend: None,
+) -> None:
+    # Regression: a retrieved object's `.tensor` must reshape to the stored
+    # multi-dim KV_2LTD shape. A stray set_used_size() call in the read path
+    # sets _used_size_override, which forces MemoryObj.tensor to a flat 1-D
+    # uint8 view; the GPU connector then indexes dim 3 of a 1-D tensor and
+    # raises "IndexError: Dimension out of range". Asserting the tensor rank
+    # and shape guards that regression through the public interface.
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    key = _make_key()
+    encoded = key.to_string()
+    kv_shape = torch.Size([2, 1, 1, 4])  # KV_2LTD, 4-D
+    kv_dtype = torch.float16
+    kv_bytes = int(kv_shape.numel()) * torch.empty(0, dtype=kv_dtype).element_size()
+    core = _FakeCore.instances[-1]
+    core.entries[encoded] = (
+        DiskCacheMetadata(
+            path="/dev/nvme0n1@8192",
+            size=kv_bytes,
+            shape=kv_shape,
+            dtype=kv_dtype,
+            fmt=MemoryFormat.KV_2LTD,
+        ),
+        8192,
+    )
+
+    try:
+        results = backend.batched_get_blocking([key])
+        assert len(results) == 1
+        obj = results[0]
+        assert obj is not None
+        assert obj.metadata.fmt == MemoryFormat.KV_2LTD
+        tensor = obj.tensor
+        assert tensor is not None
+        # Must be the full multi-dim KV tensor, not a flattened 1-D view.
+        assert tensor.dim() == len(kv_shape)
+        assert tuple(tensor.shape) == tuple(kv_shape)
+        assert tensor.dtype == kv_dtype
     finally:
         backend.close()
 

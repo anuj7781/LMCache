@@ -1081,7 +1081,16 @@ class IouDmabufBackend(AllocatorBackendInterface):
                     entry = entries[idx]
                     assert entry is not None
                     meta, _ = entry
-                    memory_obj.set_used_size(int(meta.size))
+                    # NOTE: do NOT call memory_obj.set_used_size() here. It sets
+                    # _used_size_override, which makes MemoryObj.tensor return a
+                    # flat 1-D uint8 view (see memory_management.py) instead of
+                    # reshaping raw_data to meta.shape. The GPU connector
+                    # consumes .tensor via lmc_ops.multi_layer_kv_transfer and
+                    # requires the full KV_2LTD shape; a narrowed view raises
+                    # "IndexError: Dimension out of range". meta.size already
+                    # equals the tensor's layout size (both derive from the
+                    # per-chunk shape stored at write time), so there is nothing
+                    # to narrow -- calling it only breaks the reshape.
                     memory_obj.metadata.cached_positions = meta.cached_positions
                     results[idx] = memory_obj
                 except Exception as e:

@@ -552,6 +552,10 @@ def test_iou_dmabuf_read_locks_until_io_finishes(
         assert results[0].get_size() == 3
         assert core.rawdev.reads == [(0, 0, 4096, 12288, 16)]
         assert core.unlocked == [[encoded]]
+        # Release the retrieved object; in production the caller
+        # (StorageManager/cache_engine) owns this ref_count_down. Doing it here
+        # avoids the "garbage collected with ref_count=1" leak warning.
+        results[0].ref_count_down()
     finally:
         backend.close()
 
@@ -599,6 +603,9 @@ def test_iou_dmabuf_read_returns_reshaped_kv_tensor(
         assert tensor.dim() == len(kv_shape)
         assert tuple(tensor.shape) == tuple(kv_shape)
         assert tensor.dtype == kv_dtype
+        # Release the retrieved object (caller-owned in production) so it is
+        # not GC'd with a live ref_count, which would log a leak warning.
+        obj.ref_count_down()
     finally:
         backend.close()
 
@@ -643,6 +650,9 @@ def test_iou_dmabuf_non_blocking_get_releases_tail_after_hole(
         assert loaded[0] is returned_obj
         assert returned_obj.get_ref_count() == 1
         assert tail_obj.get_ref_count() == 0
+        # Release the returned prefix object (caller-owned in production) so it
+        # is not GC'd with a live ref_count and log a leak warning.
+        returned_obj.ref_count_down()
     finally:
         loop.close()
         backend.close()

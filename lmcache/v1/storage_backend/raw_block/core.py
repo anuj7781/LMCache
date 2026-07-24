@@ -520,6 +520,38 @@ class RawBlockCore:
                 metas.append(entry.meta if entry is not None else None)
             return metas
 
+    def get_entries_many(
+        self,
+        encoded_keys: Sequence[str],
+        *,
+        lock_refcount: bool = False,
+    ) -> list[tuple[DiskCacheMetadata, int] | None]:
+        """Return metadata and slot offsets for encoded keys under one lock.
+
+        Args:
+            encoded_keys: Ordered encoded raw-block keys to inspect.
+            lock_refcount: If true, increment L2 lock refcounts for every hit
+                while holding the index lock. Call ``unlock_many`` with the
+                locked encoded keys after the protected I/O finishes.
+
+        Returns:
+            A list aligned with ``encoded_keys``. Each hit is returned as
+            ``(metadata, slot_base_offset)``; misses are returned as ``None``.
+        """
+        entries: list[tuple[DiskCacheMetadata, int] | None] = []
+        with self._lock:
+            for encoded_key in encoded_keys:
+                entry = self._index.get(encoded_key)
+                if entry is None:
+                    entries.append(None)
+                    continue
+                entries.append((entry.meta, int(entry.offset)))
+                if lock_refcount:
+                    self._lock_refcnt[encoded_key] = (
+                        self._lock_refcnt.get(encoded_key, 0) + 1
+                    )
+        return entries
+
     def get_metadata_prefix(
         self,
         encoded_keys: Sequence[str],
@@ -610,6 +642,187 @@ class RawBlockCore:
     def data_base_offset(self) -> int:
         """Return the byte offset where raw-block data slots begin."""
         return int(self._data_base_offset)
+
+    def reserve_slot(self, key: RawBlockKeySpec, memory_obj: MemoryObj) -> int | None:
+        """Reserve a raw-block slot for an external payload write.
+
+        Args:
+            key: Raw-block key spec to reserve.
+            memory_obj: Source object whose metadata and logical byte length
+                should be published if the later write commits.
+
+        Returns:
+            The reserved slot base offset, or ``None`` if no slot is available,
+            the key already has an in-flight write, or the key is already
+            indexed.
+
+        Raises:
+            RuntimeError: If the object's logical payload cannot fit in one
+                configured slot after required transfer alignment.
+        """
+        payload_len = int(memory_obj.get_size())
+        self._validate_payload_fits(payload_len)
+        with self._lock:
+            if self._closed:
+                return None
+            if key.encoded in self._index or key.encoded in self._inflight:
+                return None
+            try:
+                offset = self._allocate_slot_locked()
+            except RuntimeError:
+                logger.warning(
+                    "RawBlockCore: no free slot available for key %s",
+                    key.encoded,
+                )
+                return None
+            meta = DiskCacheMetadata(
+                path=f"{self.device_path}@{offset}",
+                size=payload_len,
+                shape=memory_obj.metadata.shape,
+                dtype=memory_obj.metadata.dtype,
+                cached_positions=memory_obj.metadata.cached_positions,
+                fmt=memory_obj.metadata.fmt,
+                pin_count=0,
+            )
+            self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
+            return int(offset)
+
+    def write_slot_header(
+        self, key: RawBlockKeySpec, offset: int, payload_len: int
+    ) -> bool:
+        """Write a raw-block slot header for an externally written payload.
+
+        Args:
+            key: Raw-block key spec whose slot identity is encoded.
+            offset: Reserved slot base offset on the raw device.
+            payload_len: Logical payload length in bytes.
+
+        Returns:
+            True if the header write completed and still matches the in-flight
+            reservation, otherwise false.
+        """
+        with self._lock:
+            inflight = self._inflight.get(key.encoded)
+            if inflight is None or int(inflight.offset) != int(offset):
+                logger.error(
+                    "RawBlockCore header write for %s does not match an "
+                    "in-flight reservation",
+                    key.encoded,
+                )
+                return False
+            if inflight.canceled:
+                return False
+
+        header = self._encode_header(key.slot_identity, int(payload_len))
+        hdr_total = (
+            round_up(len(header), self.block_align)
+            if self._requires_transfer_alignment
+            else len(header)
+        )
+        header_buf: Any = header
+        header_payload_len = len(header)
+        if len(header) < hdr_total:
+            padded_header = bytearray(hdr_total)
+            padded_header[: len(header)] = header
+            header_buf = padded_header
+            header_payload_len = hdr_total
+        try:
+            with self._lock:
+                self._inflight_io_count += 1
+            try:
+                self._write_buffers(
+                    [int(offset)],
+                    [header_buf],
+                    [header_payload_len],
+                    [hdr_total],
+                )
+            finally:
+                with self._lock:
+                    self._inflight_io_count -= 1
+                    self._last_io_ts = time.monotonic()
+            return True
+        except Exception as e:
+            logger.error("RawBlockCore header write failed for %s: %s", key.encoded, e)
+            return False
+
+    def commit_slot(self, key: RawBlockKeySpec, offset: int) -> bool:
+        """Publish an in-flight raw-block reservation in the committed index.
+
+        Args:
+            key: Raw-block key spec whose reservation should be committed.
+            offset: Reserved slot base offset returned by ``reserve_slot``.
+
+        Returns:
+            True if the reservation was committed. False means the reservation
+            was missing, canceled, or did not match ``offset``.
+        """
+        with self._lock:
+            inflight = self._inflight.get(key.encoded)
+            if inflight is None:
+                logger.error(
+                    "RawBlockCore commit for %s without in-flight reservation",
+                    key.encoded,
+                )
+                return False
+            if int(inflight.offset) != int(offset):
+                logger.error(
+                    "RawBlockCore commit offset mismatch for %s: %s != %s",
+                    key.encoded,
+                    inflight.offset,
+                    offset,
+                )
+                return False
+
+            inflight = self._inflight.pop(key.encoded)
+            if inflight.canceled:
+                self._append_free_slot_locked(
+                    self._offset_to_slot(int(inflight.offset))
+                )
+                self._meta_dirty_total += 1
+                return False
+
+            self._index[key.encoded] = _Entry(
+                offset=inflight.offset,
+                size=inflight.meta.size,
+                meta=inflight.meta,
+            )
+            self._meta_dirty_total += 1
+            return True
+
+    def abort_slot(self, key: RawBlockKeySpec, offset: int) -> None:
+        """Abort an in-flight raw-block reservation and recycle its slot.
+
+        Safe to call unconditionally from a writer's cleanup path. If the
+        reservation was already resolved -- committed, or freed by a
+        ``commit_slot`` that observed a concurrent ``delete_many`` cancel --
+        there is nothing in-flight and this is a benign no-op. Only an offset
+        that contradicts a still-live reservation is an inconsistency.
+
+        Args:
+            key: Raw-block key spec whose reservation should be aborted.
+            offset: Reserved slot base offset returned by ``reserve_slot``.
+        """
+        with self._lock:
+            inflight = self._inflight.get(key.encoded)
+            if inflight is None:
+                # Already committed or canceled-and-freed by commit_slot; the
+                # writer's finally-block abort races that resolution normally.
+                logger.debug(
+                    "RawBlockCore abort for %s: reservation already resolved",
+                    key.encoded,
+                )
+                return
+            if int(inflight.offset) != int(offset):
+                logger.warning(
+                    "RawBlockCore abort offset mismatch for %s: %s != %s",
+                    key.encoded,
+                    inflight.offset,
+                    offset,
+                )
+                return
+            inflight = self._inflight.pop(key.encoded)
+            self._append_free_slot_locked(self._offset_to_slot(int(inflight.offset)))
+            self._meta_dirty_total += 1
 
     def put_many(
         self,
@@ -1084,20 +1297,8 @@ class RawBlockCore:
         if hasattr(buf, "cast"):
             buf = buf.cast("B")
         payload_len = len(memory_obj.byte_array)
-        payload_capacity = self.slot_bytes - self.header_bytes
-        if payload_len > payload_capacity:
-            raise RuntimeError(
-                f"RawBlockCore payload {payload_len} exceeds slot capacity "
-                f"{payload_capacity}"
-            )
-        total_len = payload_len
+        total_len = self._validate_payload_fits(payload_len)
         if self._requires_transfer_alignment:
-            total_len = round_up(payload_len, self.block_align)
-            if total_len > payload_capacity:
-                raise RuntimeError(
-                    f"Aligned payload {total_len} exceeds slot capacity "
-                    f"{payload_capacity}"
-                )
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,
@@ -1108,6 +1309,24 @@ class RawBlockCore:
             if direct_view is not None:
                 buf = direct_view
         return buf, payload_len, total_len
+
+    def _validate_payload_fits(self, payload_len: int) -> int:
+        """Return aligned transfer length after validating slot capacity."""
+        payload_capacity = self.slot_bytes - self.header_bytes
+        if payload_len > payload_capacity:
+            raise RuntimeError(
+                f"RawBlockCore payload {payload_len} exceeds slot capacity "
+                f"{payload_capacity}"
+            )
+        total_len = int(payload_len)
+        if self._requires_transfer_alignment:
+            total_len = round_up(payload_len, self.block_align)
+            if total_len > payload_capacity:
+                raise RuntimeError(
+                    f"Aligned payload {total_len} exceeds slot capacity "
+                    f"{payload_capacity}"
+                )
+        return total_len
 
     def _validate_uring_cmd_chunk(self, offset: int, total_len: int) -> None:
         """Validate one NVMe raw-command transfer range.
@@ -1373,15 +1592,17 @@ class RawBlockCore:
                     else len(header)
                 )
                 header_buf: Any = header
-                if self.io_engine != "io_uring" and len(header) < hdr_total:
-                    padded_header = bytearray(header)
-                    padded_header.extend(b"\x00" * (hdr_total - len(header)))
+                header_payload_len = len(header)
+                if len(header) < hdr_total:
+                    padded_header = bytearray(hdr_total)
+                    padded_header[: len(header)] = header
                     header_buf = padded_header
+                    header_payload_len = hdr_total
                 self._write_buffers(
                     [offset, offset + self.header_bytes],
                     [header_buf, buf],
                     [
-                        hdr_total if self.io_engine == "io_uring" else len(header),
+                        header_payload_len,
                         payload_len,
                     ],
                     [hdr_total, total_len],

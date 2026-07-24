@@ -12,6 +12,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
+from lmcache.v1.storage_backend.iou_dmabuf_backend import IouDmabufBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
@@ -128,6 +129,39 @@ def CreateStorageBackends(
     enable_nixl_storage = extra_config is not None and extra_config.get(
         "enable_nixl_storage"
     )
+    enable_iou_dmabuf = extra_config is not None and extra_config.get(
+        "iou_dmabuf.enabled", False
+    )
+    _existing = existing_backends or {}
+
+    def _backend_effective(name: str) -> bool:
+        # A backend is part of the effective set if it already exists or is
+        # being created now (i.e. not skipped). ``_skip`` equals the existing
+        # names in the dynamic /conf recreation path, so an already-present
+        # backend is still counted as active even though it is skipped.
+        return name in _existing or name not in _skip
+
+    # Strict overlap rejection must consider both directions of dynamic
+    # recreation: adding Iou while a disk backend already exists, and adding a
+    # disk backend while Iou already exists. Gate on the effective set, not on
+    # "being created now".
+    if enable_iou_dmabuf and _backend_effective("IouDmabufBackend"):
+        if (
+            config.local_disk
+            and config.max_local_disk_size > 0
+            and _backend_effective("LocalDiskBackend")
+        ):
+            raise ValueError(
+                "iou_dmabuf.enabled=true cannot be used with LocalDiskBackend "
+                "in the first cut; disable local_disk or pass "
+                "skip_backends={'LocalDiskBackend'}"
+            )
+        if config.gds_path is not None and _backend_effective("GdsBackend"):
+            raise ValueError(
+                "iou_dmabuf.enabled=true cannot be used with GdsBackend "
+                "in the first cut; unset gds_path or pass "
+                "skip_backends={'GdsBackend'}"
+            )
 
     if config.enable_pd and "PDBackend" not in _skip:
         # First Party
@@ -240,6 +274,33 @@ def CreateStorageBackends(
             dst_device,
         )
         storage_backends[str(gds_backend)] = gds_backend
+
+    if enable_iou_dmabuf and "IouDmabufBackend" not in _skip:
+        # First cut requires a LocalCPUBackend as the global staging allocator.
+        # StorageManager.batched_put stages foreign source objects into each
+        # backend's allocator via allocate_and_copy_objects, producing
+        # IouDmabufBackend-owned GPU copies that take the WRITE_FIXED fast path.
+        # Without LocalCPUBackend, IouDmabufBackend would become the global
+        # allocator and any foreign GPU source object would be silently rejected
+        # (it only accepts allocator-owned GPU memory). Require CPU staging so
+        # that path cannot be hit. Check the local variable, not the new
+        # storage_backends dict: on /conf recreation an existing LocalCPUBackend
+        # is reused into local_cpu_backend but not re-added to the dict.
+        if local_cpu_backend is None:
+            raise ValueError(
+                "iou_dmabuf.enabled=true requires a LocalCPUBackend staging "
+                "allocator in the first cut; set max_local_cpu_size > 0 (and do "
+                "not run IouDmabufBackend as the sole allocator)"
+            )
+        if IouDmabufBackend.is_available():
+            iou_backend = IouDmabufBackend(config, metadata, loop, dst_device)
+            storage_backends[str(iou_backend)] = iou_backend
+        else:
+            logger.warning(
+                "iou_dmabuf.enabled=true but lmcache_rust_raw_block_io is "
+                "missing/outdated or the kernel lacks CONFIG_DMABUF_TOKEN; "
+                "skipping IouDmabufBackend"
+            )
 
     if config.maru_path is not None and "MaruBackend" not in _skip:
         try:

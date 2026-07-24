@@ -93,12 +93,6 @@ def _build_metadata(chunk_size: int) -> LMCacheMetadata:
     )
 
 
-def _make_keys(num_ops: int) -> list[CacheEngineKey]:
-    return [
-        CacheEngineKey("iou_bench_model", 1, 0, i, DEFAULT_DTYPE) for i in range(num_ops)
-    ]
-
-
 def _fill_seeded(tensor: torch.Tensor, seed: int) -> None:
     """Fill ``tensor`` in place with a deterministic per-seed pattern.
 
@@ -137,6 +131,8 @@ class IouDmabufIOBenchmark:
         capacity_bytes: int,
         max_local_cpu_gb: float,
         verify_integrity: bool,
+        iters: int = 1,
+        target_gib: float = 0.0,
     ) -> None:
         self.device_path = device_path
         self.num_ops = num_ops
@@ -149,6 +145,8 @@ class IouDmabufIOBenchmark:
         self.mem_range_flags = mem_range_flags
         self.gpu_pool_bytes = gpu_pool_bytes
         self.capacity_bytes = capacity_bytes
+        self.iters = iters
+        self.target_gib = target_gib
         self.max_local_cpu_gb = max_local_cpu_gb
         self.verify_integrity = verify_integrity
 
@@ -301,6 +299,71 @@ class IouDmabufIOBenchmark:
 
     # -- driver --------------------------------------------------------------
 
+    def _iter_keys(self, iter_idx: int) -> list[CacheEngineKey]:
+        """Fresh keys for one iteration.
+
+        Keys must be unique per iteration: a put for an already-indexed key is
+        skipped by the backend (no I/O), so reusing keys would produce no traffic
+        after the first pass.
+        """
+        base = iter_idx * self.num_ops
+        return [
+            CacheEngineKey("iou_bench_model", 1, 0, base + i, DEFAULT_DTYPE)
+            for i in range(self.num_ops)
+        ]
+
+    def _resolve_iters(self) -> int:
+        if self.target_gib > 0:
+            per_iter = self.num_ops * _chunk_bytes(self._chunk_shape, DEFAULT_DTYPE) * 2
+            target = int(self.target_gib * (1024**3))
+            return max(1, -(-target // per_iter))  # ceil division
+        return max(1, self.iters)
+
+    def _run_iteration(self, iter_idx: int) -> tuple[float, float, int, int]:
+        """One write+read cycle over a fresh key set; recycles slots on exit.
+
+        Returns ``(write_elapsed_sec, read_elapsed_sec, misses, mismatches)``.
+        """
+        assert self._backend is not None
+        self._keys = self._iter_keys(iter_idx)
+        self._objs = self._make_source_objs()
+
+        reference: dict[CacheEngineKey, torch.Tensor] = {}
+        if self.verify_integrity:
+            for key, obj in zip(self._keys, self._objs, strict=True):
+                assert obj.tensor is not None
+                reference[key] = obj.tensor.detach().to("cpu").clone()
+
+        write_elapsed = self._write_phase()
+
+        # Free source objects so the pool has room for read slabs.
+        for obj in self._objs:
+            obj.ref_count_down()
+        self._objs = []
+
+        read_start = time.perf_counter()
+        read_results = self._read_phase()
+        read_elapsed = time.perf_counter() - read_start
+
+        misses = mismatches = 0
+        if self.verify_integrity:
+            misses, mismatches = self._verify(read_results, reference)
+
+        for _, obj in read_results:
+            if obj is not None:
+                obj.ref_count_down()
+
+        # Recycle device slots + index (untimed cleanup) so total device usage
+        # stays at one working set even across many iterations: the traffic
+        # accumulates, the on-device footprint does not.
+        for key in self._keys:
+            try:
+                self._backend.remove(key, force=True)
+            except Exception:
+                pass
+        self._keys = []
+        return write_elapsed, read_elapsed, misses, mismatches
+
     def run(self) -> dict:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA/ROCm GPU not available")
@@ -311,18 +374,22 @@ class IouDmabufIOBenchmark:
             )
 
         pool_bytes = self._resolve_pool_bytes()
+        iters = self._resolve_iters()
+        chunk_bytes = _chunk_bytes(self._chunk_shape, DEFAULT_DTYPE)
         self._loop, self._loop_thread = _start_loop()
         metadata = _build_metadata(self.chunk_size)
         config = self._build_config(pool_bytes)
 
         logger.info(
             "iou-dmabuf bench: device=%s num_ops=%d concurrency=%d source=%s "
-            "gpu_pool=%.1f MiB",
+            "gpu_pool=%.1f MiB iters=%d (~%.1f GiB total traffic)",
             self.device_path,
             self.num_ops,
             self.concurrency,
             self.source,
             pool_bytes / (1024 * 1024),
+            iters,
+            iters * self.num_ops * chunk_bytes * 2 / (1024**3),
         )
 
         self._local_cpu = LocalCPUBackend(
@@ -332,57 +399,66 @@ class IouDmabufIOBenchmark:
             config, metadata, self._loop, self.gpu_device
         )
 
+        total_write_time = 0.0
+        total_read_time = 0.0
+        total_misses = 0
+        total_mismatches = 0
         try:
-            self._keys = _make_keys(self.num_ops)
-            self._objs = self._make_source_objs()
+            for it in range(iters):
+                w_sec, r_sec, misses, mismatches = self._run_iteration(it)
+                total_write_time += w_sec
+                total_read_time += r_sec
+                total_misses += misses
+                total_mismatches += mismatches
+                if iters > 1:
+                    logger.info(
+                        "  iter %d/%d: write %.3fs read %.3fs%s",
+                        it + 1,
+                        iters,
+                        w_sec,
+                        r_sec,
+                        f" (misses={misses} mismatches={mismatches})"
+                        if self.verify_integrity
+                        else "",
+                    )
 
-            reference: dict[CacheEngineKey, torch.Tensor] = {}
-            if self.verify_integrity:
-                for key, obj in zip(self._keys, self._objs, strict=True):
-                    assert obj.tensor is not None
-                    reference[key] = obj.tensor.detach().to("cpu").clone()
-
-            write_elapsed = self._write_phase()
-
-            # Free the source objects so the pool has room for read slabs.
-            for obj in self._objs:
-                obj.ref_count_down()
-            self._objs = []
-
-            read_start = time.perf_counter()
-            read_results = self._read_phase()
-            read_elapsed = time.perf_counter() - read_start
-
-            misses = mismatches = 0
-            if self.verify_integrity:
-                misses, mismatches = self._verify(read_results, reference)
-
-            for _, obj in read_results:
-                if obj is not None:
-                    obj.ref_count_down()
-
+            total_ops = iters * self.num_ops
+            write_bytes = total_ops * chunk_bytes
+            read_bytes = total_ops * chunk_bytes
+            gib = 1024**3
             return {
                 "backend": "iou_dmabuf",
                 "source": self.source,
                 "device_path": self.device_path,
-                "num_ops": self.num_ops,
+                "iters": iters,
+                "num_ops_per_iter": self.num_ops,
+                "total_ops": total_ops,
                 "concurrency": self.concurrency,
                 "gpu_pool_bytes": pool_bytes,
-                "chunk_bytes": _chunk_bytes(self._chunk_shape, DEFAULT_DTYPE),
-                "write_elapsed_sec": write_elapsed,
-                "write_ops_per_sec": self.num_ops / write_elapsed
-                if write_elapsed > 0
+                "chunk_bytes": chunk_bytes,
+                "write_bytes_total": write_bytes,
+                "read_bytes_total": read_bytes,
+                "traffic_gib_total": (write_bytes + read_bytes) / gib,
+                "write_elapsed_sec": total_write_time,
+                "read_elapsed_sec": total_read_time,
+                "write_gib_per_sec": write_bytes / total_write_time / gib
+                if total_write_time > 0
                 else 0.0,
-                "read_elapsed_sec": read_elapsed,
-                "read_ops_per_sec": self.num_ops / read_elapsed
-                if read_elapsed > 0
+                "read_gib_per_sec": read_bytes / total_read_time / gib
+                if total_read_time > 0
+                else 0.0,
+                "write_ops_per_sec": total_ops / total_write_time
+                if total_write_time > 0
+                else 0.0,
+                "read_ops_per_sec": total_ops / total_read_time
+                if total_read_time > 0
                 else 0.0,
                 "verify_integrity": self.verify_integrity,
-                "read_misses": misses,
-                "integrity_mismatches": mismatches,
+                "read_misses": total_misses,
+                "integrity_mismatches": total_mismatches,
                 "integrity_passed": self.verify_integrity
-                and misses == 0
-                and mismatches == 0,
+                and total_misses == 0
+                and total_mismatches == 0,
             }
         finally:
             for obj in self._objs:
@@ -406,7 +482,27 @@ def main() -> None:
         required=True,
         help="raw NVMe namespace, e.g. /dev/nvme0n1 (WRITES ARE DESTRUCTIVE)",
     )
-    parser.add_argument("--num-ops", type=int, default=64, help="chunks to write/read")
+    parser.add_argument(
+        "--num-ops",
+        type=int,
+        default=64,
+        help="chunks per iteration (the GPU-pool working set)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=1,
+        help="number of write+read iterations over the working set",
+    )
+    parser.add_argument(
+        "--target-gib",
+        type=float,
+        default=0.0,
+        help=(
+            "run enough iterations to move ~this much total device traffic "
+            "(writes + reads); overrides --iters. e.g. 50 for ~50 GiB"
+        ),
+    )
     parser.add_argument("--concurrency", type=int, default=4, help="submit threads")
     parser.add_argument(
         "--source",
@@ -454,6 +550,8 @@ def main() -> None:
         capacity_bytes=args.capacity_bytes,
         max_local_cpu_gb=args.max_local_cpu_gb,
         verify_integrity=args.verify_integrity,
+        iters=args.iters,
+        target_gib=args.target_gib,
     )
     result = bench.run()
     print(json.dumps(result, indent=2))

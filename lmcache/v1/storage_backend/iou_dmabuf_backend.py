@@ -673,10 +673,16 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
             slab_idx, global_address = self._locate_owned_object(memory_obj)
             grouped.setdefault(slab_idx, []).append((memory_obj, global_address))
 
+        # NOTE: use ``.meta`` (the raw attribute), never the ``.metadata``
+        # property here. free() is reached via MemoryObj.ref_count_down()/unpin()
+        # while the object's ``self.lock`` is already held (memory_management.py),
+        # and ``.metadata`` re-acquires that same non-reentrant lock -> self
+        # deadlock. The standard allocators mutate ``.meta`` directly for the same
+        # reason; frees are already serialized by this allocator's ``self._lock``.
         for slab_idx, entries in grouped.items():
             slab_base = slab_idx * self.slab_bytes
             for memory_obj, global_address in entries:
-                memory_obj.metadata.address = global_address - slab_base
+                memory_obj.meta.address = global_address - slab_base
 
         try:
             for slab_idx, entries in grouped.items():
@@ -687,31 +693,37 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         finally:
             for entries in grouped.values():
                 for memory_obj, global_address in entries:
-                    memory_obj.metadata.address = global_address
+                    memory_obj.meta.address = global_address
 
     def _free_locked(self, memory_obj: MemoryObj) -> None:
+        # See _batched_free_locked: ``.meta`` (not ``.metadata``) is mandatory --
+        # free runs under the object's own lock, and the ``.metadata`` property
+        # would re-lock it and self-deadlock.
         if not memory_obj.is_valid():
             return
         slab_idx, global_address = self._locate_owned_object(memory_obj)
         slab_base = slab_idx * self.slab_bytes
-        memory_obj.metadata.address = global_address - slab_base
+        memory_obj.meta.address = global_address - slab_base
         try:
             self._inners[slab_idx].free(memory_obj)
         finally:
-            memory_obj.metadata.address = global_address
+            memory_obj.meta.address = global_address
 
     def _locate_owned_object(self, memory_obj: MemoryObj) -> tuple[int, int]:
         if not isinstance(memory_obj, TensorMemoryObj):
             raise ValueError("memory object was not allocated by this dmabuf pool")
         if memory_obj.parent_allocator is not self:
             raise ValueError("memory object was not allocated by this dmabuf pool")
-        global_address = int(memory_obj.metadata.address)
+        # ``.meta`` not ``.metadata``: this runs inside the free path, under the
+        # object's own lock (see _free_locked), so the locking property would
+        # deadlock.
+        global_address = int(memory_obj.meta.address)
         slab_idx = global_address // self.slab_bytes
         if slab_idx < 0 or slab_idx >= len(self._inners):
             raise ValueError("memory object address is outside the dmabuf pool")
         slab_offset = global_address - slab_idx * self.slab_bytes
         slab_size = int(self._inners[slab_idx].buffer.numel())
-        if slab_offset + int(memory_obj.metadata.phy_size) > slab_size:
+        if slab_offset + int(memory_obj.meta.phy_size) > slab_size:
             raise ValueError("memory object crosses a dmabuf slab boundary")
         return slab_idx, global_address
 

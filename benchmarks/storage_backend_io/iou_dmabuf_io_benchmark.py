@@ -133,10 +133,20 @@ class IouDmabufIOBenchmark:
         verify_integrity: bool,
         iters: int = 1,
         target_gib: float = 0.0,
+        write_concurrency: Optional[int] = None,
+        read_concurrency: Optional[int] = None,
     ) -> None:
         self.device_path = device_path
         self.num_ops = num_ops
         self.concurrency = concurrency
+        # Split so the put and get phases can be stressed independently, to
+        # localize a concurrency bug to the write path vs. the read path.
+        self.write_concurrency = (
+            write_concurrency if write_concurrency is not None else concurrency
+        )
+        self.read_concurrency = (
+            read_concurrency if read_concurrency is not None else concurrency
+        )
         self.source = source
         self.alignment = alignment
         self.chunk_size = chunk_size
@@ -236,8 +246,8 @@ class IouDmabufIOBenchmark:
 
     # -- phases --------------------------------------------------------------
 
-    def _slices(self) -> list[tuple[int, int]]:
-        size = max(1, self.num_ops // self.concurrency)
+    def _slices(self, concurrency: int) -> list[tuple[int, int]]:
+        size = max(1, self.num_ops // max(1, concurrency))
         return [
             (i, min(i + size, self.num_ops)) for i in range(0, self.num_ops, size)
         ]
@@ -256,8 +266,8 @@ class IouDmabufIOBenchmark:
                     futures.extend(result)
 
         start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
-            for lo, hi in self._slices():
+        with ThreadPoolExecutor(max_workers=self.write_concurrency) as ex:
+            for lo, hi in self._slices(self.write_concurrency):
                 ex.submit(submit_slice, lo, hi)
         for fut in futures:
             fut.result(timeout=300)
@@ -279,8 +289,8 @@ class IouDmabufIOBenchmark:
             with lock:
                 results.extend(zip(batch, loaded, strict=False))
 
-        with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
-            for lo, hi in self._slices():
+        with ThreadPoolExecutor(max_workers=self.read_concurrency) as ex:
+            for lo, hi in self._slices(self.read_concurrency):
                 ex.submit(read_slice, lo, hi)
         return results
 
@@ -463,6 +473,8 @@ class IouDmabufIOBenchmark:
                 "num_ops_per_iter": self.num_ops,
                 "total_ops": total_ops,
                 "concurrency": self.concurrency,
+                "write_concurrency": self.write_concurrency,
+                "read_concurrency": self.read_concurrency,
                 "gpu_pool_bytes": pool_bytes,
                 "chunk_bytes": chunk_bytes,
                 "write_bytes_total": write_bytes,
@@ -533,7 +545,21 @@ def main() -> None:
             "(writes + reads); overrides --iters. e.g. 50 for ~50 GiB"
         ),
     )
-    parser.add_argument("--concurrency", type=int, default=4, help="submit threads")
+    parser.add_argument(
+        "--concurrency", type=int, default=4, help="submit threads for both phases"
+    )
+    parser.add_argument(
+        "--write-concurrency",
+        type=int,
+        default=None,
+        help="override submit threads for the write phase only (default: --concurrency)",
+    )
+    parser.add_argument(
+        "--read-concurrency",
+        type=int,
+        default=None,
+        help="override submit threads for the read phase only (default: --concurrency)",
+    )
     parser.add_argument(
         "--source",
         choices=["gpu", "cpu"],
@@ -582,6 +608,8 @@ def main() -> None:
         verify_integrity=args.verify_integrity,
         iters=args.iters,
         target_gib=args.target_gib,
+        write_concurrency=args.write_concurrency,
+        read_concurrency=args.read_concurrency,
     )
     result = bench.run()
     print(json.dumps(result, indent=2))

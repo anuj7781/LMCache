@@ -369,7 +369,7 @@ class IouDmabufIOBenchmark:
         # The source tensors are filled with async GPU ops. The dmabuf WRITE_FIXED
         # reads that VRAM via a peer DMA that is NOT ordered against the GPU stream,
         # so make the fills globally visible before any write is submitted.
-        torch.cuda.synchronize(self.device)
+        torch.cuda.synchronize(torch.device(self.gpu_device))
 
         write_elapsed = self._write_phase()
 

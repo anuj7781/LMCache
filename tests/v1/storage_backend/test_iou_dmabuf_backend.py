@@ -426,6 +426,40 @@ def test_iou_dmabuf_cpu_source_uses_raw_block_put_many(
         backend.close()
 
 
+def test_iou_dmabuf_put_rejects_mismatched_batch_before_scheduling(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    first = _make_memory_obj(3)
+    second = _make_memory_obj(3)
+    core = _FakeCore.instances[-1]
+
+    try:
+        with pytest.raises(ValueError, match="same length"):
+            backend.batched_submit_put_task(
+                [_make_key(1), _make_key(2)],
+                [first],
+            )
+        with pytest.raises(ValueError, match="same length"):
+            backend.batched_submit_put_task(
+                [_make_key(1)],
+                [first, second],
+            )
+
+        assert core.puts == []
+        assert core.reservations == []
+        assert first.get_ref_count() == 1
+        assert second.get_ref_count() == 1
+        assert backend.exists_in_put_tasks(_make_key(1)) is False
+        assert backend.exists_in_put_tasks(_make_key(2)) is False
+    finally:
+        backend.close()
+
+
 def test_iou_dmabuf_owned_gpu_source_uses_write_fixed_dmabuf(
     patched_backend: None,
 ) -> None:

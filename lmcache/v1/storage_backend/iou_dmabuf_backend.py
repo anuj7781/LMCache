@@ -973,8 +973,15 @@ class IouDmabufBackend(AllocatorBackendInterface):
         Returns:
             A list of futures for scheduled writes, or None if every key was
             skipped.
+
+        Raises:
+            ValueError: If ``keys`` and ``objs`` have different lengths. The
+                batch is rejected before any writes are scheduled.
         """
         del transfer_spec
+        if len(keys) != len(objs):
+            raise ValueError("keys and objs must have the same length")
+
         futures: list[Future] = []
         for key, obj in zip(keys, objs, strict=True):
             with self._put_lock:

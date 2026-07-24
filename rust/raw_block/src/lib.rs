@@ -1496,23 +1496,6 @@ impl RawBlockDevice {
                 Ok(())
             }
 
-            fn resubmit_sqe(
-                ring: &IoUringWrapper,
-                sub: &IoSubmission,
-                user_data: u64,
-            ) -> Result<(), PyErr> {
-                build_and_submit_sqe(ring, sub, user_data)?;
-                let submitted = ring.submit().map_err(|error| {
-                    PyRuntimeError::new_err(format!("io_uring dmabuf retry submit failed: {error}"))
-                })?;
-                if submitted == 0 {
-                    return Err(PyRuntimeError::new_err(
-                        "io_uring dmabuf retry submitted no SQEs",
-                    ));
-                }
-                Ok(())
-            }
-
             // Worker thread that handles io_uring submissions and completions.
             //
             // Runs a continuous loop that:
@@ -1561,19 +1544,10 @@ impl RawBlockDevice {
                                             && sub.eagain_retries_left > 0
                                         {
                                             sub.eagain_retries_left -= 1;
-                                            if let Err(error) =
-                                                resubmit_sqe(&ring_clone, &sub, user_data)
                                             {
-                                                sub.completion.set(Err(error));
-                                                decrement_in_flight(
-                                                    &in_flight_count_clone,
-                                                    &in_flight_cvar_clone,
-                                                    &batch_in_flight_clone,
-                                                    batch_id,
-                                                );
-                                                continue;
+                                                let mut q = queue_clone.lock().unwrap();
+                                                q.insert(0, sub);
                                             }
-                                            in_flight.insert(user_data, sub);
                                             continue;
                                         }
 
@@ -1615,22 +1589,10 @@ impl RawBlockDevice {
                                                     );
                                                 }
                                             }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            // Keep the logical request in flight, but return it to
+                                            // the software queue so the normal SQE path owns its
+                                            // next user_data and submit retry.
+                                            queue_clone.lock().unwrap().insert(0, sub);
                                             continue;
                                         }
 
@@ -1664,19 +1626,10 @@ impl RawBlockDevice {
                                             && sub.eagain_retries_left > 0
                                         {
                                             sub.eagain_retries_left -= 1;
-                                            if let Err(error) =
-                                                resubmit_sqe(&ring_clone, &sub, user_data)
                                             {
-                                                sub.completion.set(Err(error));
-                                                decrement_in_flight(
-                                                    &in_flight_count_clone,
-                                                    &in_flight_cvar_clone,
-                                                    &batch_in_flight_clone,
-                                                    batch_id,
-                                                );
-                                                continue;
+                                                let mut q = queue_clone.lock().unwrap();
+                                                q.insert(0, sub);
                                             }
-                                            in_flight.insert(user_data, sub);
                                             continue;
                                         }
 
@@ -1718,22 +1671,10 @@ impl RawBlockDevice {
                                                     );
                                                 }
                                             }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            // Keep the logical request in flight, but return it to
+                                            // the software queue so the normal SQE path owns its
+                                            // next user_data and submit retry.
+                                            queue_clone.lock().unwrap().insert(0, sub);
                                             continue;
                                         }
 
@@ -1762,126 +1703,79 @@ impl RawBlockDevice {
                         // check and wait() is buffered, not lost.
                         if !shutdown_clone.load(Ordering::Relaxed)
                             && queue_clone.lock().unwrap().is_empty()
+                            && ring_clone.submission_len() == 0
                         {
                             batch_ready_clone.wait();
                         }
 
-                        let mut q = queue_clone.lock().unwrap();
-                        if !q.is_empty() {
-                            // Take all pending requests from our queue and submit them to io_uring.
-                            //
-                            // - Remove all pending requests from queue
-                            // - Check how much space is available in the ring (max 256 entries)
-                            // - If batch is larger than available space, put excess back in queue
-                            // - Increment in_flight_count for each request we're about to submit
-                            // - Build SQE (Submission Queue Entry) for each request
-                            // - Push SQEs to the ring
-                            // - Call submit() to send them to the kernel
-                            //
-                            // Fixed Buffer Support:
-                            // - If the buffer was pre-registered with register_fixed_buffers(),
-                            //   we use ReadFixed/WriteFixed for true zero-copy I/O
-                            // - Otherwise we use regular Read/Write with user-space pointers
-                            let mut batch: Vec<IoSubmission> = std::mem::take(&mut *q);
-                            let batch_len = batch.len();
+                        let mut batch = {
+                            let mut q = queue_clone.lock().unwrap();
+                            if q.is_empty() {
+                                Vec::new()
+                            } else {
+                                // Take all pending requests from our queue and submit them to io_uring.
+                                //
+                                // - Remove all pending requests from queue
+                                // - Check how much space is available in the ring (max 256 entries)
+                                // - If batch is larger than available space, put excess back in queue
+                                // - Increment in_flight_count for each request we're about to submit
+                                // - Build SQE (Submission Queue Entry) for each request
+                                // - Push SQEs to the ring
+                                // - Call submit() to send them to the kernel
+                                //
+                                // Fixed Buffer Support:
+                                // - If the buffer was pre-registered with register_fixed_buffers(),
+                                //   we use ReadFixed/WriteFixed for true zero-copy I/O
+                                // - Otherwise we use regular Read/Write with user-space pointers
+                                let mut batch: Vec<IoSubmission> = std::mem::take(&mut *q);
+                                let batch_len = batch.len();
 
-                            let available = ring_size - ring_clone.submission_len();
-                            let to_submit_count = std::cmp::min(available, batch_len);
+                                let available =
+                                    ring_size.saturating_sub(ring_clone.submission_len());
+                                let to_submit_count = std::cmp::min(available, batch_len);
 
-                            if to_submit_count < batch_len {
-                                let remaining: Vec<_> = batch[to_submit_count..].to_vec();
-                                if !remaining.is_empty() {
-                                    q.extend(remaining);
-                                }
-                            }
-
-                            drop(q);
-
-                            // Track user_data values for each submission to clean up in_flight entries
-                            // if submit() fails or returns partial count
-                            let mut user_data_list: Vec<u64> = Vec::with_capacity(to_submit_count);
-                            for sub in batch.iter().take(to_submit_count) {
-                                let user_data = next_user_data;
-                                next_user_data = next_user_data.wrapping_add(1);
-                                user_data_list.push(user_data);
-                                in_flight.insert(user_data, sub.clone());
-
-                                // Build and submit SQE
-                                let _ = build_and_submit_sqe(&ring_clone, sub, user_data);
-                            }
-
-                            let submit_result = match &ring_clone {
-                                IoUringWrapper::Standard(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                                IoUringWrapper::Big(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                            };
-                            // Handle EAGAIN (ring full) and EINTR (interrupted syscall)
-                            match submit_result {
-                                Ok(submitted) => {
-                                    // Any remaining requests in batch that weren't submitted
-                                    // will be retried in the next iteration of the loop
-                                    if submitted < to_submit_count {
-                                        // Remove in_flight entries for unsubmitted requests
-                                        for user_data in user_data_list[submitted..].iter() {
-                                            in_flight.remove(user_data);
-                                        }
-                                        // Put unsubmitted requests back in the queue for retry
-                                        let unsubmitted: Vec<_> =
-                                            batch[submitted..to_submit_count].to_vec();
-                                        if !unsubmitted.is_empty() {
-                                            let mut q = queue_clone.lock().unwrap();
-                                            // Insert unsubmitted requests back at the front preserving order
-                                            q.splice(0..0, unsubmitted);
-                                        }
+                                if to_submit_count < batch_len {
+                                    let remaining = batch.split_off(to_submit_count);
+                                    if !remaining.is_empty() {
+                                        q.extend(remaining);
                                     }
                                 }
-                                Err(e) => {
-                                    // Handle submission errors
-                                    let error_code = e.raw_os_error();
-                                    match error_code {
-                                        Some(libc::EAGAIN) | Some(libc::EINTR) => {
-                                            // Ring is full, or the operation was interrupted due
-                                            // to signal. We need to wait for completions and then retry
-                                            // Remove in_flight entries for all submissions in this batch
-                                            for user_data in user_data_list.iter() {
-                                                in_flight.remove(user_data);
-                                            }
-                                            // Put unsubmitted requests back in queue for next iteration
-                                            if to_submit_count > 0 {
-                                                let unsubmitted: Vec<_> =
-                                                    batch[..to_submit_count].to_vec();
-                                                let mut q = queue_clone.lock().unwrap();
-                                                // Insert unsubmitted requests back at the front preserving order
-                                                q.splice(0..0, unsubmitted);
-                                            }
-                                        }
-                                        _ => {
-                                            // Error: fail all pending submissions in this batch.
-                                            // Remove in_flight entries since these won't generate completions
-                                            for user_data in user_data_list.iter() {
-                                                in_flight.remove(user_data);
-                                            }
-                                            for sub in batch.iter_mut().take(to_submit_count) {
-                                                let batch_id = sub.batch_id;
-                                                sub.completion.set(Err(PyRuntimeError::new_err(
-                                                    format!("io_uring submit error: {:?}", e),
-                                                )));
-                                                let _ = sub.bounce.take();
-                                                decrement_in_flight(
-                                                    &in_flight_count_clone,
-                                                    &in_flight_cvar_clone,
-                                                    &batch_in_flight_clone,
-                                                    batch_id,
-                                                );
-                                            }
-                                        }
-                                    }
+
+                                batch
+                            }
+                        };
+
+                        for mut sub in batch.drain(..) {
+                            let user_data = next_user_data;
+                            next_user_data = next_user_data.wrapping_add(1);
+
+                            match build_and_submit_sqe(&ring_clone, &sub, user_data) {
+                                Ok(()) => {
+                                    // Once an SQE is pushed, the request remains tracked until
+                                    // its CQE arrives. A partial or failed submit leaves the SQE
+                                    // queued in the ring for the next submit attempt.
+                                    in_flight.insert(user_data, sub);
                                 }
+                                Err(error) => {
+                                    let batch_id = sub.batch_id;
+                                    let _ = sub.bounce.take();
+                                    sub.completion.set(Err(error));
+                                    decrement_in_flight(
+                                        &in_flight_count_clone,
+                                        &in_flight_cvar_clone,
+                                        &batch_in_flight_clone,
+                                        batch_id,
+                                    );
+                                }
+                            }
+                        }
+
+                        if ring_clone.submission_len() > 0 {
+                            // A partial submission or syscall error leaves unconsumed SQEs in
+                            // the ring. Keep their in_flight entries intact and retry the same
+                            // SQEs instead of rebuilding duplicate requests.
+                            if ring_clone.submit().is_err() {
+                                thread::yield_now();
                             }
                         }
                     }

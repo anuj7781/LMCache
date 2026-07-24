@@ -33,6 +33,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends
 from lmcache.v1.storage_backend.iou_dmabuf_backend import IouDmabufBackend
 from lmcache.v1.storage_backend.raw_block import RawBlockKeySpec, RawBlockPutManyResult
+from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
 class _FakeRawDevice:
@@ -87,6 +88,7 @@ class _FakeCore:
         self.commits: list[tuple[RawBlockKeySpec, int]] = []
         self.aborts: list[tuple[RawBlockKeySpec, int]] = []
         self.unlocked: list[list[str]] = []
+        self.lock_counts: dict[str, int] = {}
         self.closed = False
         _FakeCore.instances.append(self)
 
@@ -94,7 +96,12 @@ class _FakeCore:
         return self.rawdev
 
     def exists_many(self, encoded_keys: list[str], *, lock: bool = False) -> list[bool]:
-        del lock
+        if lock:
+            for encoded_key in encoded_keys:
+                if encoded_key in self.entries:
+                    self.lock_counts[encoded_key] = (
+                        self.lock_counts.get(encoded_key, 0) + 1
+                    )
         return [encoded_key in self.entries for encoded_key in encoded_keys]
 
     def get_entries_many(
@@ -137,6 +144,12 @@ class _FakeCore:
 
     def unlock_many(self, encoded_keys: list[str]) -> None:
         self.unlocked.append(list(encoded_keys))
+        for encoded_key in encoded_keys:
+            count = self.lock_counts.get(encoded_key, 0)
+            if count <= 1:
+                self.lock_counts.pop(encoded_key, None)
+            else:
+                self.lock_counts[encoded_key] = count - 1
 
     def delete_many(
         self,
@@ -766,6 +779,75 @@ def test_iou_dmabuf_read_total_miss_returns_empty_list(
         backend.close()
 
 
+def test_iou_dmabuf_nested_pins_release_matching_core_locks(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    key = _make_key()
+    encoded = key.to_string()
+    core = _FakeCore.instances[-1]
+    core.entries[encoded] = (
+        DiskCacheMetadata(
+            path="/dev/nvme0n1@8192",
+            size=3,
+            shape=torch.Size([3]),
+            dtype=torch.uint8,
+            fmt=MemoryFormat.KV_2LTD,
+        ),
+        8192,
+    )
+
+    try:
+        assert backend.pin(key) is True
+        assert backend.pin(key) is True
+        assert core.lock_counts[encoded] == 2
+
+        assert backend.unpin(key) is True
+        assert core.lock_counts[encoded] == 1
+        assert backend.unpin(key) is True
+        assert encoded not in core.lock_counts
+        assert core.unlocked == [[encoded], [encoded]]
+    finally:
+        backend.close()
+
+
+def test_storage_manager_does_not_write_back_iou_gpu_objects() -> None:
+    manager = StorageManager.__new__(StorageManager)
+    iou_backend = MagicMock()
+    local_cpu_backend = MagicMock()
+    key = _make_key()
+    single = _make_memory_obj(3)
+    batched = _make_memory_obj(3)
+    manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", local_cpu_backend),
+            ("IouDmabufBackend", iou_backend),
+        ]
+    )
+    manager.get_active_storage_backends = MagicMock(  # type: ignore[method-assign]
+        return_value=iter([("IouDmabufBackend", iou_backend)])
+    )
+
+    try:
+        iou_backend.get_blocking.return_value = single
+        assert manager.get(key) is single
+        local_cpu_backend.submit_put_task.assert_not_called()
+
+        active_backends = manager.get_active_storage_backends
+        assert isinstance(active_backends, MagicMock)
+        active_backends.return_value = iter([("IouDmabufBackend", iou_backend)])
+        iou_backend.batched_get_blocking.return_value = [batched]
+        assert manager.batched_get([key]) == [batched]
+        local_cpu_backend.batched_submit_put_task.assert_not_called()
+    finally:
+        single.ref_count_down()
+        batched.ref_count_down()
+
+
 def test_create_storage_backends_rejects_overlapping_local_disk() -> None:
     config = LMCacheEngineConfig.from_defaults(
         local_cpu=False,
@@ -939,6 +1021,39 @@ def test_iou_dmabuf_rejects_negative_mem_range_flags(
         )
 
 
+def test_iou_dmabuf_rejects_non_direct_io_config(
+    patched_backend: None,
+) -> None:
+    with pytest.raises(ValueError, match="use_odirect=true"):
+        IouDmabufBackend(
+            _make_config({"iou_dmabuf.use_odirect": False}),
+            _make_metadata(),
+            asyncio.new_event_loop(),
+        )
+
+
+def test_iou_dmabuf_rejects_uring_cmd_config(
+    patched_backend: None,
+) -> None:
+    with pytest.raises(ValueError, match="does not support io_uring_cmd"):
+        IouDmabufBackend(
+            _make_config({"iou_dmabuf.use_uring_cmd": True}),
+            _make_metadata(),
+            asyncio.new_event_loop(),
+        )
+
+
+def test_iou_dmabuf_rejects_unimplemented_require_p2p(
+    patched_backend: None,
+) -> None:
+    with pytest.raises(NotImplementedError, match="require_p2p=true"):
+        IouDmabufBackend(
+            _make_config({"iou_dmabuf.require_p2p": True}),
+            _make_metadata(),
+            asyncio.new_event_loop(),
+        )
+
+
 def test_hip_driver_exports_dmabuf_with_address_range_handle_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1078,4 +1193,61 @@ def test_dmabuf_allocator_rounded_read_does_not_clobber_neighbor(
             first.ref_count_down()
         if second is not None:
             second.ref_count_down()
+        allocator.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="DmabufGPUAllocator requires a torch CUDA/HIP device",
+)
+def test_dmabuf_allocator_reuses_capacity_across_slab_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each exported slab must retain independently reusable free capacity."""
+    # First Party
+    from lmcache.v1.storage_backend import iou_dmabuf_backend as mod
+
+    class _FakeCudaDriver:
+        def export_dmabuf(
+            self,
+            device_ptr: int,
+            size: int,
+            flags: int = 0,
+        ) -> int:
+            del device_ptr, size, flags
+            return os.open(os.devnull, os.O_RDONLY)
+
+    slab_bytes = 64 * 1024
+    monkeypatch.setattr(mod, "_SZ_1G", slab_bytes)
+    monkeypatch.setattr(mod, "_CudaDriver", _FakeCudaDriver)
+    allocator = mod.DmabufGPUAllocator(
+        pool_bytes=2 * slab_bytes,
+        device="cuda:0",
+        block_align=4096,
+        exporter="cuda_pool",
+    )
+    first: Optional[MemoryObj] = None
+    second: Optional[MemoryObj] = None
+    replacement: Optional[MemoryObj] = None
+    try:
+        shape = torch.Size([48 * 1024])
+        first = allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY)
+        second = allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY)
+        assert first is not None and second is not None
+        assert int(first.metadata.address) == 0
+        assert int(second.metadata.address) == slab_bytes
+        assert allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY) is None
+
+        first.ref_count_down()
+        first = None
+        replacement = allocator.allocate(shape, torch.uint8, MemoryFormat.BINARY)
+        assert replacement is not None
+        assert int(replacement.metadata.address) == 0
+    finally:
+        if first is not None:
+            first.ref_count_down()
+        if second is not None:
+            second.ref_count_down()
+        if replacement is not None:
+            replacement.ref_count_down()
         allocator.close()

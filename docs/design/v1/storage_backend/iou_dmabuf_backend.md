@@ -283,7 +283,11 @@ assert abs_offset % SZ_1G + total_len ≤ SZ_1G
 
 Allocating `chunk_bytes` but checking only `chunk_bytes` would let the aligned tail
 spill past the 1 GiB boundary into the next slab's dmabuf, addressing the wrong
-buffer. Reserve `total_len` in the GPU pool and in the NVMe slot payload region.
+buffer. Each exported slab therefore has its own `TensorMemoryAllocator`; an
+allocation is satisfied wholly by one slab or fails. This avoids permanently
+consuming padding at slab boundaries and makes freed capacity independently reusable
+within every slab. Reserve `total_len` in the GPU pool and in the NVMe slot payload
+region.
 
 ---
 
@@ -465,6 +469,14 @@ def abort_slot(self, key: RawBlockKeySpec, offset: int) -> None:
 `put_many()` is unchanged and remains the write path for all non-dmabuf callers.
 These four methods expose the same lock/inflight/index logic that already exists
 inside `put_many()` without duplicating it.
+
+Forced deletion has one additional lifetime rule. If `delete_many(force=True)`
+removes an entry whose lock refcount is nonzero, the key disappears from the index
+immediately but its slot moves to a retired map instead of the free list.
+`unlock_many()` returns that slot to the free list only when the last lock is
+released. Reservations for the same key are rejected while it is retired. This
+prevents an eviction or explicit forced remove from reusing an NVMe offset while a
+DMA read from that offset is still in flight.
 
 ---
 
@@ -699,30 +711,32 @@ The native layer exposes counters (via Python property or metrics callback):
 - implements the `MemoryAllocatorInterface.allocate(shapes, dtypes, fmt)` contract
   (memory_management.py:3062) that §11's `initialize_allocator` must return.
 
-`DmabufGPUAllocator` is therefore a thin subclass/wrapper of `GPUMemoryAllocator`
-that adds only two things: (a) it constructs the pool with `align_bytes = block_align`
-(4096) so every allocation is O_DIRECT-aligned; (b) it exports the pool as ≤1 GiB
-dmabuf slabs and maps a `MemoryObj`'s `metadata.address` to `(slab_idx, buf_offset)`.
-The tensor wrapping itself is *not* new code — it is the existing, proven
+`DmabufGPUAllocator` reuses the same pool-allocation and `TensorMemoryAllocator`
+building blocks, but owns one inner allocator per exported slab. It constructs the
+pool with `align_bytes = block_align` (4096), exports the pool as ≤1 GiB dmabuf
+slabs, and maps a `MemoryObj`'s global `metadata.address` to
+`(slab_idx, buf_offset)`. The tensor wrapping itself is the existing
 `TensorMemoryAllocator` path. This narrows the P1 gate (§8.1) to a single unknown:
-whether the pool tensor's pointer is *exportable* via `cuMemGetHandleForAddressRange`.
+whether the pool tensor's pointer is exportable through the selected driver API.
 
 ```
 DmabufGPUAllocator(GPUMemoryAllocator-based)
 ├── pool_tensor: torch.empty(pool_bytes, uint8, cuda)   (one contiguous allocation)
-├── inner: TensorMemoryAllocator(pool_tensor, align_bytes=block_align)
-│      manages [0, pool_bytes) offset space; returns real TensorMemoryObj views
-└── slab_fds: List[SlabDescriptor]   (one dmabuf_fd per 1 GiB sub-range)
+├── inners: List[TensorMemoryAllocator]
+│      one allocator per exported slab; no allocation can cross a slab boundary
+└── slabs: List[SlabDescriptor]   (one dmabuf_fd per ≤1 GiB sub-range)
 ```
 
 - `allocate(shapes, dtypes, fmt) → Optional[MemoryObj]`
-  (MemoryAllocatorInterface signature): delegates to `inner.allocate(...)`. The
-  returned `TensorMemoryObj` already has `parent_allocator = self` and
-  `metadata.address = abs_offset`. Allocation size is rounded to `total_len`
-  (§4.3/C1) so the O_DIRECT transfer never overflows the slot or crosses a slab.
+  (MemoryAllocatorInterface signature): tries each slab allocator in order. A
+  successful slab-local address is translated to a pool-global address and
+  `parent_allocator` is set to the outer allocator. Allocation size is rounded to
+  `total_len` (§4.3/C1), so the O_DIRECT transfer never overflows the slot or
+  crosses a slab.
 
-- `free(memory_obj)`: delegates to `inner.free(...)`, returning the offset range to
-  the pool. **The pool memory is recycled**, not returned to the driver — the
+- `free(memory_obj)`: maps the global address back to its slab allocator and returns
+  the offset range to that slab. **The pool memory is recycled**, not returned to the
+  driver — the
   `pool_tensor` and its dmabuf slabs live for the backend's lifetime. Consequence
   (m6): a `TensorMemoryObj` returned from a read is a *view into recyclable pool
   memory*. Any consumer (the GPU connector's D2D copy into paged KV) must complete
@@ -812,8 +826,8 @@ batched_get_blocking(keys: list[CacheEngineKey])
 │         encoded_keys, lock_refcount=True
 │     )  → list[(DiskCacheMetadata, slot_base_offset) | None]
 │         lock_refcount=True increments _lock_refcnt for each hit, preventing
-│         delete_many() / eviction from reclaiming the slot while I/O is
-│         in flight. Matches get_metadata_prefix(lock=True) behavior.
+│         normal eviction from deleting the key. A forced delete removes the
+│         key but retires, rather than reuses, its slot until unlock.
 │     locked_keys = [k for k, e in zip(encoded_keys, entries) if e is not None]
 │
 │   [Steps 2–4 run inside try; step 5 runs in the finally block]
@@ -850,25 +864,23 @@ same value used by `_write_one()` and `load_many_into()`). The thread pool
 Rust worker thread serializes SQE submission to the ring internally. If profiling
 shows ring contention, shard to multiple rings at that point.
 
+Public `pin()` calls are reference-counted at both the backend and core layers.
+Two owners pinning the same key require two matching `unpin()` calls; collapsing
+owners into a set would release the core lock after the first unpin and expose the
+other owner to eviction.
+
 ---
 
 ## 10. Write Path: GPU VRAM → NVMe
 
-`batched_submit_put_task` (§11) receives a `MemoryObj` allocated by any backend —
-**most commonly `LocalCPUBackend` (CPU DRAM)**, because that is the default global
-allocator in `StorageManager`'s common path. The dmabuf `WRITE_FIXED` path is only a
-*win* when the source is already registered GPU VRAM. For a CPU-resident source, a
-GPU-staged dmabuf write would do `CPU → GPU slab (H2D) → NVMe (WRITE_FIXED)` — which
-is strictly **slower** than a plain `CPU → NVMe` O_DIRECT write and adds a bounce
-that this feature exists to remove. Therefore the write path **branches on
-ownership** into three cases (it does **not** stage CPU memory into the GPU, and it
-does **not** send foreign GPU memory to the CPU write path):
+`batched_submit_put_task` (§11) accepts a `MemoryObj` allocated by any backend and
+branches on ownership into three cases:
 
 - **Registered GPU source** (`owns()` true): direct `WRITE_FIXED` from the source's
   own slab (the fast path this backend is for).
-- **CPU source** (source tensor on `cpu`): delegate to `RawBlockCore.put_many()`,
-  which reserves, writes header + payload with correct O_DIRECT alignment, and
-  commits atomically. No GPU staging, no dmabuf.
+- **CPU source** (source tensor on `cpu`): direct callers may delegate to
+  `RawBlockCore.put_many()`, which reserves, writes header + payload with correct
+  O_DIRECT alignment, and commits atomically.
 - **Foreign/unregistered GPU source** (source tensor on CUDA but not owned by this
   allocator): **rejected in MVP** with a clear error. `put_many()` is *not* safe
   here: it reads `obj.byte_array` (core.py:663-665), which casts
@@ -944,16 +956,16 @@ put_one(key: CacheEngineKey, memory_obj, on_complete_callback)   # per-key body 
           Runs on every exit: CPU-path put, no-slot early return, commit, or abort.
 ```
 
-**Why no GPU staging branch (M1).** Staging a CPU source into a registered slab just
-to use `WRITE_FIXED` never pays off — it adds an H2D bounce that is worse than a
-plain `CPU → NVMe` write — so CPU sources take `put_many` directly. Foreign GPU
-sources are a separate matter: they *cannot* use `put_many` at all (its `byte_array`
-read assumes host memory), so rather than silently adding a GPU→CPU staging copy,
-the MVP **rejects** them (step 2, else-branch) and surfaces a warning. A future
-opt-in could stage foreign GPU memory either D2H into a CPU buffer for `put_many` or
-D2D into a registered slab for `WRITE_FIXED`; both are out of first-cut scope. The
-NVMe → GPU read path (§9) always targets a registered slab, so it never needs any of
-this.
+**StorageManager staging behavior (M1).** The direct CPU fallback above is part of
+the backend API, but it is not the normal `StorageManager.batched_put` path.
+`StorageManager` calls `allocate_and_copy_objects` for each backend allocator before
+submission. For this backend, a CPU source is copied H2D into a registered slab and
+the resulting owned object takes the `WRITE_FIXED` path. The first cut requires a
+`LocalCPUBackend` as the global allocator so foreign GPU objects cannot bypass this
+staging contract. Foreign GPU objects passed directly to the backend still cannot
+use `put_many` because its `byte_array` access assumes host memory; they are rejected
+rather than interpreted as CPU pointers. The NVMe → GPU read path (§9) always
+targets a registered slab.
 
 ---
 
@@ -1142,6 +1154,12 @@ path (§10). Were it the sole allocator, a foreign GPU source object could reach
 `_put_one` and be silently rejected (§10 rejects unowned GPU memory). Forcing CPU
 staging removes that path; a first-class GPU→GPU staging copy is deferred.
 
+Blocking reads are intentionally excluded from `StorageManager`'s generic
+`LocalCPUBackend` write-back. The returned object is a view into the finite
+registered GPU slab pool; submitting that same object by reference to the CPU
+backend would retain GPU capacity rather than create a CPU copy. The caller consumes
+and releases the object under the normal `MemoryObj` refcount contract.
+
 `NixlStorageBackend` is unaffected (different storage tier). Promoting the dmabuf
 backend ahead of `GdsBackend` in default traversal is deferred until it is stable.
 
@@ -1162,14 +1180,21 @@ extra_config:
   iou_dmabuf.slot_bytes: 16781312           # 16 MiB + header room
   iou_dmabuf.ring_depth: 256
   iou_dmabuf.max_eagain_retries: 16
+  iou_dmabuf.use_odirect: true            # required in the first cut
+  iou_dmabuf.use_uring_cmd: false         # required; dmabuf uses READ/WRITE_FIXED
   iou_dmabuf.exporter: "auto"              # implemented: auto | cuda_pool | hip
   iou_dmabuf.mem_range_flags: 0            # optional cuMem/hipMem export flags
-  iou_dmabuf.require_p2p: false            # true = refuse init when P2P unverified
+  iou_dmabuf.require_p2p: false            # true is not implemented; fails init
 ```
 
 `exporter: "auto"` chooses `hip` on ROCm PyTorch (`torch.version.hip`) and
 `cuda_pool` otherwise. Deferred exporter names fail fast rather than silently
 falling back.
+
+The first cut rejects `use_odirect: false` because the raw block layout and transfer
+rounding assume direct I/O. It also rejects `use_uring_cmd: true`: the DMA-BUF ABI is
+implemented with fixed-buffer read/write operations against an NVMe block device,
+not NVMe uring commands.
 
 Implemented exporters:
 
@@ -1199,11 +1224,12 @@ also probe the PCIe mapping flag (`1` for both
 
 P2P (PCIe peer-to-peer DMA) is an optimization, not a correctness requirement.
 The kernel silently falls back to a host-memory-mediated path when P2P is
-unavailable. The backend must make this observable.
+unavailable. The first cut does not have a reliable userspace signal that proves the
+path selected for an individual I/O.
 
 ### 13.1 Startup diagnostic
 
-At init, after successful dmabuf registration, attempt to determine P2P status:
+Deferred production work may attempt to determine P2P status at startup:
 
 - Check `CONFIG_PCI_P2PDMA` via `/boot/config-$(uname -r)` or
   `/proc/config.gz` — its absence guarantees no P2P.
@@ -1218,9 +1244,11 @@ At init, after successful dmabuf registration, attempt to determine P2P status:
 
 ### 13.2 `require_p2p` config key
 
-When `iou_dmabuf.require_p2p: true`, refuse backend init if P2P cannot be
-confirmed. This lets operators enforce the performance contract rather than silently
-running at reduced throughput. Default is `false` (correctness-first startup).
+`iou_dmabuf.require_p2p: true` is rejected with `NotImplementedError` in the first
+cut. Treating successful DMA-BUF registration or a topology heuristic as proof of
+P2P would provide a false performance guarantee. The default is `false`; reliable
+enforcement is deferred until the kernel or tracing path exposes a trustworthy
+signal.
 
 ### 13.3 Runtime metrics
 
@@ -1238,7 +1266,7 @@ guarantee that data actually travelled via P2P DMA on any given I/O.
 | GPU export API unavailable        | Refuse init; log error; suggest GdsBackend          |
 | `CONFIG_PCI_P2PDMA=y` missing     | Init succeeds; warn; host-memory DMA path used      |
 | P2P topology mismatch             | Init succeeds; warn; host-memory DMA path used      |
-| `require_p2p: true` + no P2P     | Refuse init; log error                              |
+| `require_p2p: true`              | Refuse init; enforcement is not implemented         |
 | Rust rawdev extension not built   | `is_available()` returns False; fall back silently  |
 
 ---
@@ -1330,20 +1358,22 @@ accepts the single D2D copy.
 
 ## 16. Implementation Phases
 
-First cut = P0 + P1 + P2. After P2, **normal LMCache put/get works** on NVIDIA: a
-CPU-allocated source (the common `StorageManager` path) stores via the `put_many`
-fallback, a registered-GPU source stores via `WRITE_FIXED`, and reads land in GPU
-slabs. The P2 read path already pins entries for the I/O lifetime
+First cut = P0 + P1 + P2. After P2, **normal LMCache put/get works**: a
+CPU-allocated source in the common `StorageManager` path is staged into the
+backend's registered GPU allocator and stores via `WRITE_FIXED`; a direct backend
+call with a CPU object can use the `put_many` fallback; reads land in GPU slabs. The
+P2 read path already pins entries for the I/O lifetime
 (`get_entries_many(lock_refcount=True)` + `unlock_many`, §9) so reads cannot race
 eviction — this is part of P2, not deferred. Overlapping disk backends must be
-disabled or the backend `location`-addressed (§11.2). P3+ adds only P2P diagnostics,
-AMD, and tuning — none of which block basic correctness.
+disabled because construction rejects them (§11.2). P3+ adds only P2P diagnostics
+and tuning; AMD HIP address-range export is already implemented and hardware-smoke
+tested.
 
 | Phase | Scope                                                                        | Gate                                              |
 |-------|------------------------------------------------------------------------------|---------------------------------------------------|
 | P0    | New Rust methods on `RawBlockDevice` (§7): `probe_dmabuf_support` (`#[staticmethod]`), `register_dmabuf_buffers`, `read_fixed_dmabuf`, `write_fixed_dmabuf`; **rebuild+install the maturin crate under `rust/raw_block` (§2.2)** | Crate builds/installs with dmabuf methods; `probe_dmabuf_support()` returns True on patched kernel; udmabuf smoke test passes with block-aligned lengths |
 | P1    | GPU pool allocation reusing `GPUMemoryAllocator` (NVIDIA); dmabuf **export** proven (§8.1) | **`cuMemGetHandleForAddressRange` exports a 1 GiB sub-range of the pool tensor** (record any `PYTORCH_CUDA_ALLOC_CONF` needed); exported fd registers and a round-trip READ_FIXED/WRITE_FIXED verifies on GPU. **P2 must not begin until this passes.** |
-| P2    | New `RawBlockCore` methods (`get_entries_many`, `reserve_slot`, `write_slot_header`, `commit_slot`, `abort_slot`); `DmabufGPUAllocator` + full `AllocatorBackendInterface` surface (§11/M4); full §10 write dispatch — direct GPU-source `WRITE_FIXED` + **CPU-source `put_many` fallback** + **foreign-GPU rejection**; read path (§9) **including the `lock_refcount=True` / `unlock_many` lock lifetime** (intrinsic to a correct read — unlocked reads race eviction, not optional) | Normal `StorageManager` put/get works end-to-end (CPU-allocated source stores via fallback; a registered-GPU source stores via `WRITE_FIXED`) on real NVMe + GPU, `location="IouDmabufBackend"`; O_DIRECT length rounding (C1) verified with a non-4K-multiple chunk; foreign GPU source rejected (not corrupted); a read holding a slot survives a concurrent `delete_many`/eviction |
+| P2    | New `RawBlockCore` methods (`get_entries_many`, `reserve_slot`, `write_slot_header`, `commit_slot`, `abort_slot`); `DmabufGPUAllocator` + full `AllocatorBackendInterface` surface (§11/M4); full §10 write dispatch — owned GPU-source `WRITE_FIXED` + **direct CPU-source `put_many` fallback** + **foreign-GPU rejection**; read path (§9) **including the `lock_refcount=True` / `unlock_many` lock lifetime** (intrinsic to a correct read — unlocked reads race eviction, not optional) | Normal `StorageManager` put/get works end-to-end (CPU source staged into a registered GPU slab and stored via `WRITE_FIXED`) on real NVMe + GPU, `location="IouDmabufBackend"`; direct backend CPU fallback works; O_DIRECT length rounding (C1) verified with a non-4K-multiple chunk; foreign GPU source rejected (not corrupted); a read holding a slot survives concurrent forced deletion without slot reuse |
 | P3    | P2P diagnostics (§13) | P2P status logged at startup |
-| P4    | AMD HIP address-range export path; AMD DRM GEM fallback remains deferred until needed | AMD GPU smoke test passes                         |
-| P5    | Metrics counters; `require_p2p` enforcement; default-traversal promotion; batched async get | Perf benchmark vs `GdsBackend`; production readiness review |
+| P4    | AMD HIP address-range export path (implemented and smoke-tested); AMD DRM GEM fallback remains deferred until needed | AMD GPU smoke test passes                         |
+| P5    | Metrics counters; reliable `require_p2p` enforcement; default-traversal promotion; batched async get | Perf benchmark vs `GdsBackend`; production readiness review |

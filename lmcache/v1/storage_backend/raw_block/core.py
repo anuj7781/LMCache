@@ -304,6 +304,7 @@ class RawBlockCore:
         self._index: dict[str, _Entry] = {}
         self._lock_refcnt: dict[str, int] = {}
         self._inflight: dict[str, _Inflight] = {}
+        self._retired: dict[str, _Entry] = {}
 
         self._next_slot: int = 0
         self._free_slots: list[int] = []
@@ -665,7 +666,11 @@ class RawBlockCore:
         with self._lock:
             if self._closed:
                 return None
-            if key.encoded in self._index or key.encoded in self._inflight:
+            if (
+                key.encoded in self._index
+                or key.encoded in self._inflight
+                or key.encoded in self._retired
+            ):
                 return None
             try:
                 offset = self._allocate_slot_locked()
@@ -861,7 +866,7 @@ class RawBlockCore:
                 if key.encoded in self._index:
                     results[i] = True
                     continue
-                if key.encoded in self._inflight:
+                if key.encoded in self._inflight or key.encoded in self._retired:
                     continue
 
                 try:
@@ -1043,6 +1048,11 @@ class RawBlockCore:
                 refcnt = self._lock_refcnt.get(encoded_key, 0)
                 if refcnt <= 1:
                     self._lock_refcnt.pop(encoded_key, None)
+                    retired = self._retired.pop(encoded_key, None)
+                    if retired is not None:
+                        self._append_free_slot_locked(
+                            self._offset_to_slot(int(retired.offset))
+                        )
                 else:
                     self._lock_refcnt[encoded_key] = refcnt - 1
 
@@ -1075,12 +1085,16 @@ class RawBlockCore:
                 inflight = self._inflight.get(encoded_key)
                 if inflight is not None:
                     inflight.canceled = True
-                self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
-                        self._offset_to_slot(int(removed_entry.offset))
-                    )
+                    if locked:
+                        self._retired[encoded_key] = removed_entry
+                    else:
+                        self._append_free_slot_locked(
+                            self._offset_to_slot(int(removed_entry.offset))
+                        )
                     self._meta_dirty_total += 1
+                if not locked:
+                    self._lock_refcnt.pop(encoded_key, None)
                 deleted.append(removed_entry is not None or inflight is not None)
         return deleted
 
@@ -1096,7 +1110,7 @@ class RawBlockCore:
             usable_capacity = self._max_slots * self.slot_bytes
             if usable_capacity <= 0:
                 return (-1.0, -1.0)
-            used_slots = len(self._index) + len(self._inflight)
+            used_slots = len(self._index) + len(self._inflight) + len(self._retired)
             usage = (used_slots * self.slot_bytes) / usable_capacity
             return (usage, usage)
 
@@ -1131,6 +1145,7 @@ class RawBlockCore:
                 "usable_capacity_bytes": self._max_slots * self.slot_bytes,
                 "indexed_key_count": len(self._index),
                 "inflight_key_count": len(self._inflight),
+                "retired_key_count": len(self._retired),
                 "locked_key_count": sum(
                     1 for refcnt in self._lock_refcnt.values() if refcnt > 0
                 ),
@@ -1802,7 +1817,11 @@ class RawBlockCore:
                 "meta_version": self.meta_version,
                 "data_base_offset": self._data_base_offset,
                 "next_slot": self._next_slot,
-                "free_slots": list(self._free_slots),
+                "free_slots": list(self._free_slots)
+                + [
+                    self._offset_to_slot(int(entry.offset))
+                    for entry in self._retired.values()
+                ],
                 "entries": {
                     encoded_key: {
                         "offset": entry.offset,
@@ -1989,6 +2008,7 @@ class RawBlockCore:
             self._free_slots = free_slots
             self._index.clear()
             self._lock_refcnt.clear()
+            self._retired.clear()
 
             entries = data.get("entries", {})
             if isinstance(entries, dict):

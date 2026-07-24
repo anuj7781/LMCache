@@ -139,6 +139,36 @@ def test_raw_block_core_get_entries_many_locks_hits(tmp_path):
         core.close()
 
 
+def test_raw_block_core_force_delete_defers_slot_reuse_until_unlock(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+
+    try:
+        spec = encode_object_key(make_object_key(35))
+        obj = make_memory_obj(b"locked-read")
+        assert core.put_many([spec], [obj]).results == [True]
+        offset = core.entry_offset(spec.encoded)
+        assert offset is not None
+
+        assert core.exists_many([spec.encoded], lock=True) == [True]
+        assert core.delete_many([spec.encoded], force=True) == [True]
+        assert core.contains_key(spec.encoded) is False
+        assert core.report_status()["retired_key_count"] == 1
+
+        # The key is gone, but its slot remains reserved while a DMA reader
+        # may still be using the corresponding device offset.
+        assert core.reserve_slot(spec, obj) is None
+
+        core.unlock_many([spec.encoded])
+        assert core.report_status()["retired_key_count"] == 0
+        reused = core.reserve_slot(spec, obj)
+        assert reused == offset
+        core.abort_slot(spec, reused)
+    finally:
+        core.close()
+
+
 def test_raw_block_core_slot_lifecycle_commit_external_payload(tmp_path):
     path = make_raw_block_file(tmp_path)
     config = make_raw_block_core_config(path)

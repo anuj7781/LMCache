@@ -437,7 +437,6 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         self.exporter = resolved_exporter
         self.mem_range_flags = int(mem_range_flags)
         self._closed = False
-        self._boundary_guards: list[MemoryObj] = []
         self._lock = threading.Lock()
 
         with torch.cuda.device(self.device):
@@ -449,11 +448,17 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         if self.tensor.data_ptr() % page_size != 0:
             raise RuntimeError("GPU pool pointer is not host-page aligned")
 
-        self._inner = TensorMemoryAllocator(
-            self.tensor,
-            align_bytes=self.block_align,
-        )
         self.slabs = self._export_slabs(page_size)
+        self._inners: list[TensorMemoryAllocator] = []
+        for slab in self.slabs:
+            slab_start = slab.buf_slot * self.slab_bytes
+            slab_end = slab_start + slab.size
+            self._inners.append(
+                TensorMemoryAllocator(
+                    self.tensor[slab_start:slab_end],
+                    align_bytes=self.block_align,
+                )
+            )
 
     @property
     def dmabuf_fds(self) -> list[int]:
@@ -472,6 +477,7 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         """
         return (
             isinstance(obj, TensorMemoryObj)
+            and obj.is_valid()
             and obj.parent_allocator is self
             and 0 <= int(obj.metadata.address) < self.pool_bytes
         )
@@ -589,7 +595,7 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         """
         del allocator_type
         with self._lock:
-            self._inner.free(memory_obj)
+            self._free_locked(memory_obj)
 
     def batched_free(
         self,
@@ -606,21 +612,18 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         """
         del allocator_type
         with self._lock:
-            self._inner.batched_free(memory_objs, update_stats=update_stats)
+            self._batched_free_locked(memory_objs, update_stats=update_stats)
 
     def memcheck(self) -> bool:
         """Return whether the wrapped tensor allocator is internally consistent."""
         with self._lock:
-            return self._inner.memcheck()
+            return all(inner.memcheck() for inner in self._inners)
 
     def close(self) -> None:
         """Close exported DMA-BUF fds after io_uring unregisters them."""
         if self._closed:
             return
         self._closed = True
-        with self._lock:
-            self._batched_free_locked(self._boundary_guards)
-            self._boundary_guards.clear()
         for slab in self.slabs:
             try:
                 os.close(slab.dmabuf_fd)
@@ -648,40 +651,69 @@ class DmabufGPUAllocator(MemoryAllocatorInterface):
         if round_up(raw_size, self.block_align) > self.slab_bytes:
             raise ValueError("single allocation exceeds dmabuf slab size")
 
-        for _ in range(len(self.slabs) + 1):
-            obj = self._inner.allocate(shapes_list, dtypes_list, fmt)
+        for slab, inner in zip(self.slabs, self._inners, strict=True):
+            obj = inner.allocate(shapes_list, dtypes_list, fmt)
             if obj is None:
-                return None
-            total_len = self.transfer_len(obj)
-            if self._fits_in_slab(int(obj.metadata.address), total_len):
-                obj.parent_allocator = self
-                return obj
-
-            address = int(obj.metadata.address)
-            self._inner.free(obj)
-            padding = self.slab_bytes - (address % self.slab_bytes)
-            if padding <= 0 or padding >= self.slab_bytes:
-                return None
-            guard = self._inner.allocate(
-                torch.Size([padding]),
-                torch.uint8,
-                MemoryFormat.BINARY,
-            )
-            if guard is None:
-                return None
-            self._boundary_guards.append(guard)
+                continue
+            obj.metadata.address += slab.buf_slot * self.slab_bytes
+            obj.parent_allocator = self
+            return obj
         return None
 
-    def _batched_free_locked(self, memory_objs: list[MemoryObj]) -> None:
-        if memory_objs:
-            self._inner.batched_free(memory_objs)
+    def _batched_free_locked(
+        self,
+        memory_objs: list[MemoryObj],
+        *,
+        update_stats: bool = True,
+    ) -> None:
+        grouped: dict[int, list[tuple[MemoryObj, int]]] = {}
+        for memory_obj in memory_objs:
+            if not memory_obj.is_valid():
+                continue
+            slab_idx, global_address = self._locate_owned_object(memory_obj)
+            grouped.setdefault(slab_idx, []).append((memory_obj, global_address))
 
-    def _fits_in_slab(self, abs_offset: int, total_len: int) -> bool:
-        slab_idx = abs_offset // self.slab_bytes
-        if slab_idx >= len(self.slabs):
-            return False
-        buf_offset = abs_offset % self.slab_bytes
-        return buf_offset + total_len <= self.slabs[slab_idx].size
+        for slab_idx, entries in grouped.items():
+            slab_base = slab_idx * self.slab_bytes
+            for memory_obj, global_address in entries:
+                memory_obj.metadata.address = global_address - slab_base
+
+        try:
+            for slab_idx, entries in grouped.items():
+                self._inners[slab_idx].batched_free(
+                    [memory_obj for memory_obj, _ in entries],
+                    update_stats=update_stats,
+                )
+        finally:
+            for entries in grouped.values():
+                for memory_obj, global_address in entries:
+                    memory_obj.metadata.address = global_address
+
+    def _free_locked(self, memory_obj: MemoryObj) -> None:
+        if not memory_obj.is_valid():
+            return
+        slab_idx, global_address = self._locate_owned_object(memory_obj)
+        slab_base = slab_idx * self.slab_bytes
+        memory_obj.metadata.address = global_address - slab_base
+        try:
+            self._inners[slab_idx].free(memory_obj)
+        finally:
+            memory_obj.metadata.address = global_address
+
+    def _locate_owned_object(self, memory_obj: MemoryObj) -> tuple[int, int]:
+        if not isinstance(memory_obj, TensorMemoryObj):
+            raise ValueError("memory object was not allocated by this dmabuf pool")
+        if memory_obj.parent_allocator is not self:
+            raise ValueError("memory object was not allocated by this dmabuf pool")
+        global_address = int(memory_obj.metadata.address)
+        slab_idx = global_address // self.slab_bytes
+        if slab_idx < 0 or slab_idx >= len(self._inners):
+            raise ValueError("memory object address is outside the dmabuf pool")
+        slab_offset = global_address - slab_idx * self.slab_bytes
+        slab_size = int(self._inners[slab_idx].buffer.numel())
+        if slab_offset + int(memory_obj.metadata.phy_size) > slab_size:
+            raise ValueError("memory object crosses a dmabuf slab boundary")
+        return slab_idx, global_address
 
     def _export_slabs(self, page_size: int) -> list[SlabDescriptor]:
         export_driver = self._make_export_driver()
@@ -809,6 +841,19 @@ class IouDmabufBackend(AllocatorBackendInterface):
             raise ValueError(
                 "extra_config['iou_dmabuf.max_eagain_retries'] must be >= 0"
             )
+        if not _get_extra_bool(self.extra, "iou_dmabuf.use_odirect", True):
+            raise ValueError(
+                "IouDmabufBackend requires iou_dmabuf.use_odirect=true"
+            )
+        if _get_extra_bool(self.extra, "iou_dmabuf.use_uring_cmd", False):
+            raise ValueError(
+                "IouDmabufBackend does not support io_uring_cmd; use an "
+                "O_DIRECT NVMe block-device path"
+            )
+        if _get_extra_bool(self.extra, "iou_dmabuf.require_p2p", False):
+            raise NotImplementedError(
+                "iou_dmabuf.require_p2p=true is not implemented in the first cut"
+            )
 
         core: RawBlockCore | None = None
         memory_allocator: DmabufGPUAllocator | None = None
@@ -837,7 +882,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
         self._pin_lock = threading.Lock()
-        self._pinned_keys: set[str] = set()
+        self._pin_counts: dict[str, int] = {}
         self._future_lock = threading.Lock()
         self._pending_futures: set[Future] = set()
         self._thread_pool = ThreadPoolExecutor(
@@ -1215,8 +1260,6 @@ class IouDmabufBackend(AllocatorBackendInterface):
         spec = encode_legacy_key(key)
         with self._pin_lock:
             removed = self._core.delete_many([spec.encoded], force=force)[0]
-            if removed:
-                self._pinned_keys.discard(spec.encoded)
             return removed
 
     def get_allocator_backend(self) -> AllocatorBackendInterface:
@@ -1316,11 +1359,11 @@ class IouDmabufBackend(AllocatorBackendInterface):
 
     def calculate_chunk_budget(self) -> int:
         """Return the number of full chunks that fit in the GPU dmabuf pool."""
-        chunk_bytes = self._default_chunk_size_bytes()
-        return self.memory_allocator.pool_bytes // round_up(
-            chunk_bytes,
+        chunk_bytes = round_up(
+            self._default_chunk_size_bytes(),
             self.block_align,
         )
+        return sum(slab.size // chunk_bytes for slab in self.memory_allocator.slabs)
 
     def touch_cache(self) -> None:
         """No-op cache touch hook for storage manager compatibility."""
@@ -1374,7 +1417,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
             block_align=self.block_align,
             header_bytes=self.header_bytes,
             slot_bytes=slot_bytes,
-            use_odirect=_get_extra_bool(self.extra, "iou_dmabuf.use_odirect", True),
+            use_odirect=True,
             enable_zero_copy=True,
             meta_total_bytes=_get_extra_int(
                 self.extra,
@@ -1423,11 +1466,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
             ),
             io_engine="io_uring",
             iouring_queue_depth=ring_depth,
-            use_uring_cmd=_get_extra_bool(
-                self.extra,
-                "iou_dmabuf.use_uring_cmd",
-                False,
-            ),
+            use_uring_cmd=False,
         )
 
     def _default_chunk_size_bytes(self) -> int:
@@ -1664,17 +1703,19 @@ class IouDmabufBackend(AllocatorBackendInterface):
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:
-            if encoded_key in self._pinned_keys:
-                return True
             if not self._core.exists_many([encoded_key], lock=True)[0]:
                 return False
-            self._pinned_keys.add(encoded_key)
+            self._pin_counts[encoded_key] = self._pin_counts.get(encoded_key, 0) + 1
             return True
 
     def _unpin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:
-            if encoded_key in self._pinned_keys:
+            count = self._pin_counts.get(encoded_key, 0)
+            if count > 0:
                 self._core.unlock_many([encoded_key])
-                self._pinned_keys.discard(encoded_key)
+                if count == 1:
+                    self._pin_counts.pop(encoded_key, None)
+                else:
+                    self._pin_counts[encoded_key] = count - 1
                 return True
             return self._core.exists_many([encoded_key], lock=False)[0]

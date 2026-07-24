@@ -366,6 +366,11 @@ class IouDmabufIOBenchmark:
                 assert obj.tensor is not None
                 reference[key] = obj.tensor.detach().to("cpu").clone()
 
+        # The source tensors are filled with async GPU ops. The dmabuf WRITE_FIXED
+        # reads that VRAM via a peer DMA that is NOT ordered against the GPU stream,
+        # so make the fills globally visible before any write is submitted.
+        torch.cuda.synchronize(self.device)
+
         write_elapsed = self._write_phase()
 
         # Free source objects so the pool has room for read slabs.

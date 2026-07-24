@@ -165,6 +165,10 @@ class IouDmabufIOBenchmark:
         self._backend: Optional[IouDmabufBackend] = None
         self._keys: list[CacheEngineKey] = []
         self._objs: list[MemoryObj] = []
+        # Globally-unique fill seed base for the current iteration, so every
+        # chunk across all iterations has distinct content (catches stale reads
+        # from recycled slots, not just intra-iteration swaps).
+        self._seed_base = 0
 
     # -- setup ---------------------------------------------------------------
 
@@ -226,7 +230,7 @@ class IouDmabufIOBenchmark:
                     "increase --gpu-pool-bytes / --max-local-cpu-gb or lower --num-ops"
                 )
             assert obj.tensor is not None
-            _fill_seeded(obj.tensor, i)
+            _fill_seeded(obj.tensor, self._seed_base + i)
             objs.append(obj)
         return objs
 
@@ -284,18 +288,33 @@ class IouDmabufIOBenchmark:
         self,
         read_results: list[tuple[CacheEngineKey, Optional[MemoryObj]]],
         reference: dict[CacheEngineKey, torch.Tensor],
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[str]]:
+        """Return (misses, mismatches, detail strings classifying each mismatch)."""
         misses = 0
         mismatches = 0
+        details: list[str] = []
+        ref_items = list(reference.items())
         for key, obj in read_results:
             if obj is None or obj.tensor is None:
                 misses += 1
                 continue
             got = obj.tensor.detach().to("cpu")
             want = reference.get(key)
-            if want is None or not torch.equal(got, want):
-                mismatches += 1
-        return misses, mismatches
+            if want is not None and torch.equal(got, want):
+                continue
+            mismatches += 1
+            # Classify: did we read another chunk's committed data (a slot/offset
+            # swap), or something that matches no written chunk (corruption)?
+            swap = None
+            for other_key, other_ref in ref_items:
+                if other_key is not key and torch.equal(got, other_ref):
+                    swap = other_key
+                    break
+            if swap is not None:
+                details.append(f"{key.to_string()} <- data of {swap.to_string()} (swap)")
+            else:
+                details.append(f"{key.to_string()} <- foreign/corrupt data")
+        return misses, mismatches, details
 
     # -- driver --------------------------------------------------------------
 
@@ -319,12 +338,15 @@ class IouDmabufIOBenchmark:
             return max(1, -(-target // per_iter))  # ceil division
         return max(1, self.iters)
 
-    def _run_iteration(self, iter_idx: int) -> tuple[float, float, int, int]:
+    def _run_iteration(
+        self, iter_idx: int
+    ) -> tuple[float, float, int, int, list[str]]:
         """One write+read cycle over a fresh key set; recycles slots on exit.
 
-        Returns ``(write_elapsed_sec, read_elapsed_sec, misses, mismatches)``.
+        Returns ``(write_sec, read_sec, misses, mismatches, mismatch_details)``.
         """
         assert self._backend is not None
+        self._seed_base = iter_idx * self.num_ops
         self._keys = self._iter_keys(iter_idx)
         self._objs = self._make_source_objs()
 
@@ -346,8 +368,9 @@ class IouDmabufIOBenchmark:
         read_elapsed = time.perf_counter() - read_start
 
         misses = mismatches = 0
+        details: list[str] = []
         if self.verify_integrity:
-            misses, mismatches = self._verify(read_results, reference)
+            misses, mismatches, details = self._verify(read_results, reference)
 
         for _, obj in read_results:
             if obj is not None:
@@ -362,7 +385,7 @@ class IouDmabufIOBenchmark:
             except Exception:
                 pass
         self._keys = []
-        return write_elapsed, read_elapsed, misses, mismatches
+        return write_elapsed, read_elapsed, misses, mismatches, details
 
     def run(self) -> dict:
         if not torch.cuda.is_available():
@@ -403,13 +426,19 @@ class IouDmabufIOBenchmark:
         total_read_time = 0.0
         total_misses = 0
         total_mismatches = 0
+        mismatch_details: list[str] = []
         try:
             for it in range(iters):
-                w_sec, r_sec, misses, mismatches = self._run_iteration(it)
+                w_sec, r_sec, misses, mismatches, details = self._run_iteration(it)
                 total_write_time += w_sec
                 total_read_time += r_sec
                 total_misses += misses
                 total_mismatches += mismatches
+                for d in details:
+                    mismatch_details.append(f"iter {it}: {d}")
+                if details:
+                    for d in details:
+                        logger.error("  MISMATCH iter %d: %s", it, d)
                 if iters > 1:
                     logger.info(
                         "  iter %d/%d: write %.3fs read %.3fs%s",
@@ -456,6 +485,7 @@ class IouDmabufIOBenchmark:
                 "verify_integrity": self.verify_integrity,
                 "read_misses": total_misses,
                 "integrity_mismatches": total_mismatches,
+                "mismatch_details": mismatch_details[:50],
                 "integrity_passed": self.verify_integrity
                 and total_misses == 0
                 and total_mismatches == 0,

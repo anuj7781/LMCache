@@ -21,7 +21,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
@@ -976,7 +976,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
         """
         del transfer_spec
         futures: list[Future] = []
-        for key, obj in zip(keys, objs, strict=False):
+        for key, obj in zip(keys, objs, strict=True):
             with self._put_lock:
                 if key in self._put_tasks:
                     continue
@@ -1048,7 +1048,10 @@ class IouDmabufBackend(AllocatorBackendInterface):
             location: Unused compatibility argument.
 
         Returns:
-            Future producing the loaded memory object or None.
+            Future producing the loaded memory object, or None if the key is
+            not present. The presence check is best-effort: if the key is
+            evicted between this check and the read, the future resolves to
+            None (a benign miss), never an error.
         """
         del location
         if not self.contains(key):
@@ -1088,32 +1091,17 @@ class IouDmabufBackend(AllocatorBackendInterface):
             for idx, entry in enumerate(entries):
                 if entry is None:
                     continue
-                meta, slot_base_offset = entry
-                if meta.shape is None or meta.dtype is None or meta.fmt is None:
-                    logger.warning(
-                        "IouDmabufBackend: metadata incomplete for key %s",
-                        encoded_keys[idx],
-                    )
+                prepared = self._prepare_read(encoded_keys[idx], entry)
+                if prepared is None:
                     continue
-                memory_obj = self.allocate(meta.shape, meta.dtype, meta.fmt)
-                if memory_obj is None:
-                    logger.warning(
-                        "IouDmabufBackend: failed to allocate GPU slab for key %s",
-                        encoded_keys[idx],
-                    )
-                    continue
+                memory_obj, slab_idx, buf_offset, total_len, device_offset = prepared
                 try:
-                    total_len = round_up(int(meta.size), self.block_align)
-                    slab_idx, buf_offset = self.memory_allocator.decompose(
-                        int(memory_obj.metadata.address),
-                        total_len,
-                    )
                     future = self._submit_tracked(
                         self._read_into_dmabuf,
                         slab_idx,
                         buf_offset,
                         total_len,
-                        int(slot_base_offset) + self.header_bytes,
+                        device_offset,
                     )
                     read_futures.append((idx, future, memory_obj))
                 except Exception:
@@ -1470,6 +1458,21 @@ class IouDmabufBackend(AllocatorBackendInterface):
         )
 
     def _default_chunk_size_bytes(self) -> int:
+        """Return the byte size of a full KV chunk, used to size raw-block slots.
+
+        Derives the size from ``metadata.kv_shape``, whose layout is
+        ``(num_layers, kv_size, num_tokens, num_heads, head_size)`` -- the same
+        convention ``LMCacheMetadata`` uses (``kv_size`` is the K/V dimension,
+        i.e. 2). The stored ``num_tokens`` (index 2) is ignored; the token count
+        comes from ``config.chunk_size`` instead, so the result is the size of a
+        *full* chunk (slots are fixed at the maximum chunk size).
+
+        Returns:
+            Full-chunk size in bytes.
+
+        Raises:
+            ValueError: If metadata is unavailable (required to derive the size).
+        """
         if self.metadata is None:
             raise ValueError(
                 "metadata is required when iou_dmabuf.slot_bytes is not configured"
@@ -1534,6 +1537,19 @@ class IouDmabufBackend(AllocatorBackendInterface):
             )
 
     def _get_one_direct(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Load one key into a GPU slab inline on the calling worker thread.
+
+        Unlike ``batched_get_blocking``, the dmabuf read is issued directly
+        rather than re-submitted to the thread pool, so a single-key
+        ``get_non_blocking`` cannot deadlock the pool when
+        ``disk_io_threads == 1``.
+
+        Args:
+            key: Cache key to load.
+
+        Returns:
+            The loaded memory object, or None on miss or read failure.
+        """
         raw_key = encode_legacy_key(key)
         entries = self._core.get_entries_many(
             [raw_key.encoded],
@@ -1542,36 +1558,17 @@ class IouDmabufBackend(AllocatorBackendInterface):
         entry = entries[0]
         if entry is None:
             return None
-
-        memory_obj: Optional[MemoryObj] = None
         try:
-            meta, slot_base_offset = entry
-            if meta.shape is None or meta.dtype is None or meta.fmt is None:
-                logger.warning(
-                    "IouDmabufBackend: metadata incomplete for key %s",
-                    raw_key.encoded,
-                )
+            prepared = self._prepare_read(raw_key.encoded, entry)
+            if prepared is None:
                 return None
-            memory_obj = self.allocate(meta.shape, meta.dtype, meta.fmt)
-            if memory_obj is None:
-                logger.warning(
-                    "IouDmabufBackend: failed to allocate GPU slab for key %s",
-                    raw_key.encoded,
-                )
-                return None
-
-            total_len = round_up(int(meta.size), self.block_align)
-            slab_idx, buf_offset = self.memory_allocator.decompose(
-                int(memory_obj.metadata.address),
-                total_len,
-            )
-            self._read_into_dmabuf(
-                slab_idx,
-                buf_offset,
-                total_len,
-                int(slot_base_offset) + self.header_bytes,
-            )
-            memory_obj.metadata.cached_positions = meta.cached_positions
+            memory_obj, slab_idx, buf_offset, total_len, device_offset = prepared
+            try:
+                self._read_into_dmabuf(slab_idx, buf_offset, total_len, device_offset)
+            except Exception:
+                memory_obj.ref_count_down()
+                raise
+            memory_obj.metadata.cached_positions = entry[0].cached_positions
             return memory_obj
         except Exception as e:
             logger.error(
@@ -1579,11 +1576,62 @@ class IouDmabufBackend(AllocatorBackendInterface):
                 raw_key.encoded,
                 e,
             )
-            if memory_obj is not None:
-                memory_obj.ref_count_down()
             return None
         finally:
             self._core.unlock_many([raw_key.encoded])
+
+    def _prepare_read(
+        self,
+        encoded_key: str,
+        entry: tuple[DiskCacheMetadata, int],
+    ) -> tuple[MemoryObj, int, int, int, int] | None:
+        """Allocate a GPU slab and resolve dmabuf read parameters for one hit.
+
+        Shared by the blocking and non-blocking read paths. Does not issue the
+        read; the caller performs the transfer (inline or via the thread pool).
+        On failure after a slab was allocated, the allocation is released before
+        returning None or propagating.
+
+        Args:
+            encoded_key: Encoded raw-block key, used only for log messages.
+            entry: The ``(metadata, slot_base_offset)`` pair returned by
+                ``RawBlockCore.get_entries_many`` for this key.
+
+        Returns:
+            ``(memory_obj, slab_idx, buf_offset, total_len, device_offset)`` on
+            success, or None when the metadata is incomplete or the GPU pool is
+            exhausted (both logged).
+
+        Raises:
+            Exception: If slab-offset decomposition fails (e.g. a transfer that
+                crosses a slab boundary); the allocated object is released
+                first.
+        """
+        meta, slot_base_offset = entry
+        if meta.shape is None or meta.dtype is None or meta.fmt is None:
+            logger.warning(
+                "IouDmabufBackend: metadata incomplete for key %s",
+                encoded_key,
+            )
+            return None
+        memory_obj = self.allocate(meta.shape, meta.dtype, meta.fmt)
+        if memory_obj is None:
+            logger.warning(
+                "IouDmabufBackend: failed to allocate GPU slab for key %s",
+                encoded_key,
+            )
+            return None
+        try:
+            total_len = round_up(int(meta.size), self.block_align)
+            slab_idx, buf_offset = self.memory_allocator.decompose(
+                int(memory_obj.metadata.address),
+                total_len,
+            )
+        except Exception:
+            memory_obj.ref_count_down()
+            raise
+        device_offset = int(slot_base_offset) + self.header_bytes
+        return memory_obj, slab_idx, buf_offset, total_len, device_offset
 
     def _put_one(
         self,
@@ -1591,6 +1639,23 @@ class IouDmabufBackend(AllocatorBackendInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
+        """Persist one source object, dispatching on where its memory lives.
+
+        Runs on a thread-pool worker. Classifies the source three ways
+        (design doc section 10): an allocator-owned GPU object takes the
+        ``WRITE_FIXED`` fast path; a CPU-resident object is written via
+        ``RawBlockCore.put_many``; any other (foreign GPU) source is rejected
+        and not stored. The completion callback fires only when the chunk is
+        actually persisted. Always releases the object's ref count and clears
+        the in-flight marker on exit.
+
+        Args:
+            key: Cache key being stored.
+            memory_obj: Source object; its ref count was incremented by the
+                caller and is released here.
+            on_complete_callback: Optional callback invoked once, only after a
+                successful store.
+        """
         raw_key = encode_legacy_key(key)
         try:
             if self.memory_allocator.owns(memory_obj):
@@ -1692,14 +1757,26 @@ class IouDmabufBackend(AllocatorBackendInterface):
             logger.warning("on_complete_callback failed for key %s: %s", key, e)
 
     def _is_cpu_readable_source(self, memory_obj: MemoryObj) -> bool:
+        """Return whether ``memory_obj`` is host memory safe for a CPU put.
+
+        The CPU put path (``RawBlockCore.put_many``) reads ``byte_array``, which
+        interprets the object's ``data_ptr`` as host memory. A CUDA device
+        pointer must therefore never be classified as CPU-readable, or put_many
+        would read device memory as host memory (garbage/segfault). Only an
+        object that positively confirms a CPU-resident tensor is accepted;
+        anything whose backing cannot be confirmed as host memory is rejected
+        and handled as an unsupported source by the caller.
+
+        Args:
+            memory_obj: Candidate source object for a put.
+
+        Returns:
+            True only when the object is a CPU-resident ``TensorMemoryObj``.
+        """
         if isinstance(memory_obj, TensorMemoryObj):
             raw_tensor = memory_obj.raw_tensor
             return raw_tensor is not None and raw_tensor.device.type == "cpu"
-        try:
-            memoryview(memory_obj.byte_array)
-            return True
-        except Exception:
-            return False
+        return False
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:

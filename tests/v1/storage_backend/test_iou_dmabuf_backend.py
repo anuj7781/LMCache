@@ -495,6 +495,49 @@ def test_iou_dmabuf_owned_gpu_no_slot_does_not_report_success(
         backend.close()
 
 
+def test_iou_dmabuf_background_put_failure_is_logged(
+    patched_backend: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.ERROR,
+        logger="lmcache.v1.storage_backend.iou_dmabuf_backend",
+    )
+    backend = IouDmabufBackend(
+        _make_config(),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    key = _make_key()
+    source = _make_memory_obj(
+        3,
+        parent_allocator=backend.memory_allocator,
+        address=4096,
+    )
+    core = _FakeCore.instances[-1]
+    core.rawdev.write_fixed_dmabuf = MagicMock(
+        side_effect=RuntimeError("forced dmabuf write failure")
+    )
+    source_released = False
+
+    try:
+        futures = backend.batched_submit_put_task([key], [source])
+        assert futures is not None
+        with pytest.raises(RuntimeError, match="forced dmabuf write failure"):
+            futures[0].result(timeout=5)
+        source.ref_count_down()
+        source_released = True
+        backend.close()
+        assert "IouDmabufBackend: background task failed" in caplog.text
+        assert "forced dmabuf write failure" in caplog.text
+        assert len(core.aborts) == 1
+    finally:
+        if not source_released:
+            source.ref_count_down()
+        if not core.closed:
+            backend.close()
+
+
 def test_iou_dmabuf_rejects_foreign_gpu_source(
     patched_backend: None,
     caplog: pytest.LogCaptureFixture,
@@ -572,6 +615,40 @@ def test_iou_dmabuf_read_locks_until_io_finishes(
         # (StorageManager/cache_engine) owns this ref_count_down. Doing it here
         # avoids the "garbage collected with ref_count=1" leak warning.
         results[0].ref_count_down()
+    finally:
+        backend.close()
+
+
+def test_iou_dmabuf_get_non_blocking_with_one_worker(
+    patched_backend: None,
+) -> None:
+    backend = IouDmabufBackend(
+        _make_config({"disk_io_threads": 1}),
+        _make_metadata(),
+        asyncio.new_event_loop(),
+    )
+    key = _make_key()
+    encoded = key.to_string()
+    core = _FakeCore.instances[-1]
+    core.entries[encoded] = (
+        DiskCacheMetadata(
+            path="/dev/nvme0n1@8192",
+            size=3,
+            shape=torch.Size([3]),
+            dtype=torch.uint8,
+            fmt=MemoryFormat.KV_2LTD,
+        ),
+        8192,
+    )
+
+    try:
+        future = backend.get_non_blocking(key)
+        assert future is not None
+        result = future.result(timeout=1)
+        assert result is not None
+        assert core.rawdev.reads == [(0, 0, 4096, 12288, 16)]
+        assert core.unlocked == [[encoded]]
+        result.ref_count_down()
     finally:
         backend.close()
 

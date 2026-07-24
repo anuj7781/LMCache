@@ -1008,7 +1008,7 @@ class IouDmabufBackend(AllocatorBackendInterface):
         del location
         if not self.contains(key):
             return None
-        return self._submit_tracked(self.get_blocking, key)
+        return self._submit_tracked(self._get_one_direct, key)
 
     def batched_get_blocking(
         self,
@@ -1480,6 +1480,71 @@ class IouDmabufBackend(AllocatorBackendInterface):
     def _discard_future(self, future: Future) -> None:
         with self._future_lock:
             self._pending_futures.discard(future)
+        if future.cancelled():
+            return
+        exception = future.exception()
+        if exception is not None:
+            logger.error(
+                "IouDmabufBackend: background task failed: %s",
+                exception,
+                exc_info=(
+                    type(exception),
+                    exception,
+                    exception.__traceback__,
+                ),
+            )
+
+    def _get_one_direct(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        raw_key = encode_legacy_key(key)
+        entries = self._core.get_entries_many(
+            [raw_key.encoded],
+            lock_refcount=True,
+        )
+        entry = entries[0]
+        if entry is None:
+            return None
+
+        memory_obj: Optional[MemoryObj] = None
+        try:
+            meta, slot_base_offset = entry
+            if meta.shape is None or meta.dtype is None or meta.fmt is None:
+                logger.warning(
+                    "IouDmabufBackend: metadata incomplete for key %s",
+                    raw_key.encoded,
+                )
+                return None
+            memory_obj = self.allocate(meta.shape, meta.dtype, meta.fmt)
+            if memory_obj is None:
+                logger.warning(
+                    "IouDmabufBackend: failed to allocate GPU slab for key %s",
+                    raw_key.encoded,
+                )
+                return None
+
+            total_len = round_up(int(meta.size), self.block_align)
+            slab_idx, buf_offset = self.memory_allocator.decompose(
+                int(memory_obj.metadata.address),
+                total_len,
+            )
+            self._read_into_dmabuf(
+                slab_idx,
+                buf_offset,
+                total_len,
+                int(slot_base_offset) + self.header_bytes,
+            )
+            memory_obj.metadata.cached_positions = meta.cached_positions
+            return memory_obj
+        except Exception as e:
+            logger.error(
+                "IouDmabufBackend: read failed for key %s: %s",
+                raw_key.encoded,
+                e,
+            )
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+            return None
+        finally:
+            self._core.unlock_many([raw_key.encoded])
 
     def _put_one(
         self,

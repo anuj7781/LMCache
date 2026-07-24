@@ -72,6 +72,19 @@ impl IoUringWrapper {
             }
         }
     }
+
+    fn submit(&self) -> io::Result<usize> {
+        match self {
+            IoUringWrapper::Standard(ring) => {
+                let ring = ring.lock().unwrap();
+                ring.submitter().submit()
+            }
+            IoUringWrapper::Big(ring) => {
+                let ring = ring.lock().unwrap();
+                ring.submitter().submit()
+            }
+        }
+    }
 }
 
 // NVMe identify namespace data structure
@@ -984,6 +997,15 @@ struct IoSubmission {
     eagain_retries_left: usize,
 }
 
+struct DmabufFixedIo {
+    is_write: bool,
+    slab_idx: u32,
+    dmabuf_offset: u64,
+    length: usize,
+    device_offset: u64,
+    max_eagain_retries: usize,
+}
+
 impl Default for IoSubmission {
     fn default() -> Self {
         IoSubmission {
@@ -1474,6 +1496,23 @@ impl RawBlockDevice {
                 Ok(())
             }
 
+            fn resubmit_sqe(
+                ring: &IoUringWrapper,
+                sub: &IoSubmission,
+                user_data: u64,
+            ) -> Result<(), PyErr> {
+                build_and_submit_sqe(ring, sub, user_data)?;
+                let submitted = ring.submit().map_err(|error| {
+                    PyRuntimeError::new_err(format!("io_uring dmabuf retry submit failed: {error}"))
+                })?;
+                if submitted == 0 {
+                    return Err(PyRuntimeError::new_err(
+                        "io_uring dmabuf retry submitted no SQEs",
+                    ));
+                }
+                Ok(())
+            }
+
             // Worker thread that handles io_uring submissions and completions.
             //
             // Runs a continuous loop that:
@@ -1522,19 +1561,19 @@ impl RawBlockDevice {
                                             && sub.eagain_retries_left > 0
                                         {
                                             sub.eagain_retries_left -= 1;
-                                            in_flight.insert(user_data, sub.clone());
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            if let Err(error) =
+                                                resubmit_sqe(&ring_clone, &sub, user_data)
+                                            {
+                                                sub.completion.set(Err(error));
+                                                decrement_in_flight(
+                                                    &in_flight_count_clone,
+                                                    &in_flight_cvar_clone,
+                                                    &batch_in_flight_clone,
+                                                    batch_id,
+                                                );
+                                                continue;
+                                            }
+                                            in_flight.insert(user_data, sub);
                                             continue;
                                         }
 
@@ -1625,19 +1664,19 @@ impl RawBlockDevice {
                                             && sub.eagain_retries_left > 0
                                         {
                                             sub.eagain_retries_left -= 1;
-                                            in_flight.insert(user_data, sub.clone());
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            if let Err(error) =
+                                                resubmit_sqe(&ring_clone, &sub, user_data)
+                                            {
+                                                sub.completion.set(Err(error));
+                                                decrement_in_flight(
+                                                    &in_flight_count_clone,
+                                                    &in_flight_cvar_clone,
+                                                    &batch_in_flight_clone,
+                                                    batch_id,
+                                                );
+                                                continue;
+                                            }
+                                            in_flight.insert(user_data, sub);
                                             continue;
                                         }
 
@@ -2012,16 +2051,15 @@ impl RawBlockDevice {
         }))
     }
 
-    fn submit_dmabuf_fixed_io(
-        &self,
-        py: Python<'_>,
-        is_write: bool,
-        slab_idx: u32,
-        dmabuf_offset: u64,
-        length: usize,
-        device_offset: u64,
-        max_eagain_retries: usize,
-    ) -> PyResult<usize> {
+    fn submit_dmabuf_fixed_io(&self, py: Python<'_>, request: DmabufFixedIo) -> PyResult<usize> {
+        let DmabufFixedIo {
+            is_write,
+            slab_idx,
+            dmabuf_offset,
+            length,
+            device_offset,
+            max_eagain_retries,
+        } = request;
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -2251,12 +2289,14 @@ impl RawBlockDevice {
     ) -> PyResult<usize> {
         self.submit_dmabuf_fixed_io(
             py,
-            false,
-            slab_idx,
-            dmabuf_offset,
-            length,
-            device_offset,
-            max_eagain_retries,
+            DmabufFixedIo {
+                is_write: false,
+                slab_idx,
+                dmabuf_offset,
+                length,
+                device_offset,
+                max_eagain_retries,
+            },
         )
     }
 
@@ -2279,12 +2319,14 @@ impl RawBlockDevice {
     ) -> PyResult<usize> {
         self.submit_dmabuf_fixed_io(
             py,
-            true,
-            slab_idx,
-            dmabuf_offset,
-            length,
-            device_offset,
-            max_eagain_retries,
+            DmabufFixedIo {
+                is_write: true,
+                slab_idx,
+                dmabuf_offset,
+                length,
+                device_offset,
+                max_eagain_retries,
+            },
         )
     }
 

@@ -21,7 +21,7 @@ What it checks
 1. The default PyTorch allocator pointer.
 2. A *sub-range* of that allocation -- the backend exports <=1 GiB sub-ranges of a
    larger pool, so sub-range export must work too.
-3. (CUDA only) the PCIe-mapping flag, which a peer NVMe device needs for real P2P.
+3. The CUDA/HIP PCIe-mapping flag, which a peer NVMe device needs for real P2P.
 
 Usage
 -----
@@ -89,6 +89,8 @@ class HipDriver(GpuDriver):
     handle_type_dmabuf = 1
     # hipSuccess == 0
     success = 0
+    # hipMemRangeFlagDmaBufMappingTypePcie == 0x1
+    _PCIE_FLAG = 1
 
     def __init__(self) -> None:
         lib = None
@@ -165,6 +167,9 @@ class HipDriver(GpuDriver):
             ctypes.c_ulonglong(flags),
         )
         return self._finish_export(rc, fd)
+
+    def pcie_flag(self) -> Optional[int]:
+        return self._PCIE_FLAG
 
     def remediation(self) -> list[str]:
         lines = [
@@ -398,9 +403,9 @@ def main() -> int:
                 0,
             )
 
-        # 3. PCIe mapping flag (CUDA only) -- what a peer NVMe device needs for real
-        #    P2P. Informational: a failure here with #1 passing means export works
-        #    but P2P may fall back through host memory, or the driver predates it.
+        # 3. PCIe mapping flag -- what a peer NVMe device needs for real P2P.
+        #    Informational: a failure here with #1 passing means export works but
+        #    P2P may fall back through host memory, or the driver predates it.
         pcie = driver.pcie_flag()
         if pcie is not None:
             attempt(

@@ -1187,8 +1187,11 @@ Deferred exporters:
 2. **`amd_drm`** (AMD fallback): DRM GEM allocation + import.
 
 `iou_dmabuf.mem_range_flags` is passed directly to the CUDA/HIP address-range
-export call. Keep it `0` first; on AMD, try the HIP PCIe mapping flag only if the
-default export fails on the target driver.
+export call. Use `0` to validate generic DMA-BUF export. For NVMe P2P testing,
+also probe the PCIe mapping flag (`1` for both
+`CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE` and
+`hipMemRangeFlagDmaBufMappingTypePcie`) and configure
+`iou_dmabuf.mem_range_flags: 1` when that export succeeds.
 
 ---
 

@@ -893,6 +893,19 @@ class IouDmabufBackend(AllocatorBackendInterface):
 
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        # Serializes dmabuf WRITE_FIXED submissions. Concurrent writes (peer DMA
+        # reading exported GPU VRAM) corrupt data on the current kernel/amdgpu
+        # stack, while concurrent reads and single-threaded writes are clean --
+        # isolated with tools/diagnose_iou_dmabuf_coherency.py, which reproduces
+        # the corruption through the raw RawBlockDevice path with no LMCache
+        # logic involved. Holding this lock around write_fixed_dmabuf keeps at
+        # most one peer-read-from-VRAM in flight, restoring correctness. Reads
+        # are left concurrent. Disable via iou_dmabuf.serialize_dmabuf_writes to
+        # measure raw concurrent-write throughput (known to corrupt).
+        self._serialize_dmabuf_writes = _get_extra_bool(
+            self.extra, "iou_dmabuf.serialize_dmabuf_writes", True
+        )
+        self._dmabuf_write_lock = threading.Lock()
         self._pin_lock = threading.Lock()
         self._pin_counts: dict[str, int] = {}
         self._future_lock = threading.Lock()
@@ -1733,13 +1746,25 @@ class IouDmabufBackend(AllocatorBackendInterface):
                 int(memory_obj.metadata.address),
                 total_len,
             )
-            self._rawdev.write_fixed_dmabuf(
-                slab_idx,
-                buf_offset,
-                total_len,
-                int(slot_base_offset) + self.header_bytes,
-                self.max_eagain_retries,
-            )
+            # See _dmabuf_write_lock: concurrent dmabuf WRITE_FIXED corrupts on
+            # the current kernel, so keep at most one in flight.
+            if self._serialize_dmabuf_writes:
+                with self._dmabuf_write_lock:
+                    self._rawdev.write_fixed_dmabuf(
+                        slab_idx,
+                        buf_offset,
+                        total_len,
+                        int(slot_base_offset) + self.header_bytes,
+                        self.max_eagain_retries,
+                    )
+            else:
+                self._rawdev.write_fixed_dmabuf(
+                    slab_idx,
+                    buf_offset,
+                    total_len,
+                    int(slot_base_offset) + self.header_bytes,
+                    self.max_eagain_retries,
+                )
             committed = self._core.commit_slot(raw_key, slot_base_offset)
             if not committed:
                 raise RuntimeError(f"failed to commit slot for {raw_key.encoded}")

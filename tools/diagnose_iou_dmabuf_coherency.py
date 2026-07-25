@@ -35,6 +35,7 @@ import argparse
 import ctypes
 import os
 import sys
+import threading
 
 HIP_SUCCESS = 0
 HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
@@ -129,9 +130,13 @@ def run_trial(
     concurrency: int,
     repeats: int,
     page: int,
+    serialize_writes: bool = False,
 ) -> int:
     """Return the number of corrupt chunks across all repeats for one memory type."""
-    label = "fine" if finegrained else "coarse"
+    label = ("fine" if finegrained else "coarse") + (
+        "/serialized" if serialize_writes else "/concurrent"
+    )
+    write_lock = threading.Lock()
     pool_size = num_chunks * chunk_bytes + page
     dest_size = chunk_bytes + page
 
@@ -156,11 +161,28 @@ def run_trial(
                 hip.memset(src + c * chunk_bytes, values[c], chunk_bytes)
             hip.sync()
 
-            # Fire N WRITE_FIXED concurrently: src chunk c -> device slot c.
+            # Fire N WRITE_FIXED from `concurrency` threads: src chunk c -> slot c.
+            # When serialize_writes is set, a lock keeps at most one dmabuf
+            # WRITE_FIXED in flight (the backend's fix), so this isolates whether
+            # serialization alone removes the corruption.
             def write_one(c: int) -> None:
-                dev.write_fixed_dmabuf(
-                    0, c * chunk_bytes, chunk_bytes, device_offset + c * chunk_bytes, 16
-                )
+                if serialize_writes:
+                    with write_lock:
+                        dev.write_fixed_dmabuf(
+                            0,
+                            c * chunk_bytes,
+                            chunk_bytes,
+                            device_offset + c * chunk_bytes,
+                            16,
+                        )
+                else:
+                    dev.write_fixed_dmabuf(
+                        0,
+                        c * chunk_bytes,
+                        chunk_bytes,
+                        device_offset + c * chunk_bytes,
+                        16,
+                    )
 
             with ThreadPoolExecutor(max_workers=concurrency) as ex:
                 list(ex.map(write_one, range(num_chunks)))
@@ -220,42 +242,45 @@ def main() -> int:
         f"repeat={args.repeat}\n"
     )
 
-    results = {}
-    for finegrained in (False, True):
-        # A fresh device per trial so registrations don't overlap.
+    # Coherency was ruled out (coarse and fine both corrupt). Now test the actual
+    # fix: does serializing dmabuf WRITE_FIXED (a lock keeping one in flight)
+    # remove the corruption? Compare concurrent vs serialized on coarse memory.
+    counts = {}
+    for serialize in (False, True):
         dev = RawBlockDevice(
             args.device_path, True, True, True, False, page, "io_uring", 256
         )
         try:
-            results["fine" if finegrained else "coarse"] = run_trial(
+            counts[serialize] = run_trial(
                 hip,
                 dev,
-                finegrained,
+                False,  # coarse (default backend memory)
                 args.num_chunks,
                 args.chunk_bytes,
                 args.device_offset,
                 args.concurrency,
                 args.repeat,
                 page,
+                serialize_writes=serialize,
             )
         finally:
             dev.close()
         print()
 
-    coarse, fine = results["coarse"], results["fine"]
+    concurrent, serialized = counts[False], counts[True]
     print("=== verdict ===")
-    if coarse > 0 and fine == 0:
-        print("    coarse corrupts, fine-grained is CLEAN.")
-        print("    => confirmed: AMD peer-DMA VRAM coherency. Fix = allocate the")
-        print("       exported pool as fine-grained coherent memory.")
+    if concurrent > 0 and serialized == 0:
+        print("    concurrent WRITE_FIXED corrupts; serialized is CLEAN.")
+        print("    => confirmed: concurrent dmabuf writes are the bug, and")
+        print("       serializing them (the backend fix) restores correctness.")
         return 0
-    if coarse == 0 and fine == 0:
-        print("    neither reproduced -- raise --repeat / --num-chunks / --concurrency.")
+    if concurrent == 0 and serialized == 0:
+        print("    neither reproduced -- raise --repeat / --concurrency / --num-chunks.")
         return 0
-    if coarse > 0 and fine > 0:
-        print("    BOTH corrupt -> not (only) coherency; a deeper issue remains.")
+    if serialized > 0:
+        print(f"    STILL CORRUPT WHEN SERIALIZED ({serialized}) -- serialization is")
+        print("       not sufficient; the fault is not (only) write concurrency.")
         return 1
-    print("    unexpected: fine corrupts but coarse does not.")
     return 1
 
 

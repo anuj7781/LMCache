@@ -10,29 +10,40 @@
 
 On this AMD ROCm + patched-kernel stack, the io_uring **DMA-BUF `WRITE_FIXED`
 path corrupts data** — the NVMe device's peer-to-peer DMA that **reads** exported
-AMD VRAM occasionally transfers wrong/stale bytes (~0.3–0.5% of 2 MiB chunks).
+AMD VRAM transfers wrong/stale bytes. Rate depends on how the op is issued:
+**~0.3–0.5% of 2 MiB chunks through the full LMCache backend**, but **~50–53% of
+chunks in a minimal, single-op standalone C reproducer** — including with only
+one `WRITE_FIXED` in flight at a time (see below). The defect is real,
+concurrency-independent, and reproducible with zero LMCache code involved.
 
 Established, with high confidence:
 
 - **Write-only.** `WRITE_FIXED` (NVMe peer-DMA *reads* VRAM → NVMe) corrupts;
   `READ_FIXED` (NVMe peer-DMA *writes* VRAM) is clean at all concurrencies.
-- **Not concurrency.** Corrupts even with the entire put path serialized
-  (`disk_io_threads=1`, one op at a time, nothing interleaving on the ring).
+- **Not concurrency — proven twice.** (a) Corrupts with the entire LMCache put
+  path serialized (`disk_io_threads=1`). (b) Corrupts in the standalone C repro
+  at **`--concurrency 1`** — i.e. one `WRITE_FIXED` submitted, awaited, and
+  completed before the next is even issued, no overlap possible — at **52.8%**
+  (1351/2560). This is the strongest evidence in the whole investigation: a
+  single, isolated `WRITE_FIXED` against an amdgpu-exported dma-buf is
+  unreliable, independent of any concurrency, LMCache or otherwise.
 - **Not LMCache code.** Reproduces through the raw Rust `RawBlockDevice` (no
   `RawBlockCore`, no Python backend logic), and is **confirmed in the standalone
   C program** `tools/repro_iou_dmabuf_p2p.c` (pure HIP + io_uring, no
-  LMCache/Python/Rust): **1298 / 2560 chunks corrupt (~50%)** at 8-way write
-  concurrency on `/dev/nvme0n1`, coarse VRAM (see §7.1).
+  LMCache/Python/Rust) at both concurrency 1 and 8 (see §7.1, §7.2).
 - **Not memory-coherency type.** Coarse-grained (`hipMalloc`) and fine-grained
-  (`hipExtMallocWithFlags`) source VRAM both corrupt.
+  (`hipExtMallocWithFlags`) source VRAM both corrupt, at statistically matching
+  rates (§7.1 Rust-level A/B; §7.2 C-level confirmation).
 - **Data signature:** "foreign" — the corrupt chunk holds stale/other data, not a
   clean swap of two valid chunks; often the first block(s) of a chunk are wrong.
 
-The earlier belief that "concurrency causes it" was a **false negative**: a single
-3200-op run at low concurrency can land on zero corruptions at a ~0.4% rate.
+The earlier belief that "concurrency causes it" was a **false negative** at the
+LMCache level: a single 3200-op run at a ~0.4% rate can land on zero corruptions
+by chance. The standalone repro's concurrency=1 result removes any doubt.
 
 **Action:** the dmabuf write path is unsafe on this stack; it needs a kernel/driver
-fix. Reads work. File upstream with the C repro.
+fix. Reads work. File upstream with the C repro — it is small, self-contained,
+and corrupts roughly half the time even doing nothing concurrent.
 
 ---
 
@@ -215,10 +226,46 @@ cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
   exported VRAM returning stale/other data under concurrency.
 - Environment: AMD Radeon AI PRO R9700, runtime-only ROCm, coarse VRAM
   (`hipMalloc`), `/dev/nvme0n1`, `--device-offset 4 GiB` (scratch).
-- **Still to capture:** a `--concurrency 1` run (LMCache data says it still
-  corrupts, at a lower rate); a `--finegrained` run (coherency-mode control); and
-  `dmesg` during a corrupting run. These strengthen the upstream report but the
-  core defect is already reproduced without LMCache.
+- **Still to capture:** `dmesg` during a corrupting run. See §7.2 for the
+  concurrency=1 and fine-grained confirmations, captured the same session.
+
+### 7.2 Concurrency=1 and fine-grained confirmations (2026-07-25)
+
+```
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 1 --repeat 40 \
+    --device-offset $((4<<30))
+# mem=coarse
+# corrupt 1351 / 2560 chunks (64 chunks x 40 repeats)   -- 52.8%
+# => REPRODUCED
+
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 8 --repeat 40 \
+    --finegrained
+# mem=fine-grained, dev_off=0
+# corrupt 1298 / 2560 chunks (64 chunks x 40 repeats)   -- 50.7%
+# => REPRODUCED
+```
+
+**`--concurrency 1` is the decisive result.** At concurrency 1, `run_writes`
+submits exactly one `WRITE_FIXED`, waits for its completion, and only then
+submits the next — there is never more than one write in flight, no
+interleaving, nothing for a software race to corrupt. It still corrupts
+**52.8%** of chunks. This conclusively rules out concurrency (LMCache's,
+the Rust worker's, or the raw io_uring submission pattern's) as a factor:
+
+> A single, standalone `IORING_OP_WRITE_FIXED` against a registered
+> amdgpu-exported dma-buf, issued one at a time with no other I/O in flight,
+> corrupts roughly half the time on this kernel/ROCm/GPU stack.
+
+`--finegrained` at concurrency 8 (50.7%) statistically matches the earlier
+coarse-memory concurrency-8 run (1298/2560 — the same count), confirming
+coherency mode (coarse vs fine-grained VRAM) does not affect the defect
+either, consistent with the earlier `diagnose_iou_dmabuf_coherency.py` finding.
+
+Combined with §5 (reads clean, writes corrupt) and §7.1, every independent
+variable that could plausibly explain the corruption — concurrency, VRAM
+coherency mode, LMCache software, RawBlockCore, the Rust worker — has been
+tested and ruled out. The remaining variable is the write direction itself:
+NVMe peer-DMA **reading** an amdgpu-exported dma-buf.
 
 ---
 
@@ -239,9 +286,14 @@ cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
 The LMCache io_uring DMA-BUF backend is functionally complete and correct on the
 software side (export, registration, slot lifecycle, read path all verified). It
 is **blocked by a kernel/amdgpu defect**: NVMe peer-to-peer DMA that *reads*
-exported AMD VRAM (`WRITE_FIXED`) delivers stale bytes for ~0.3–0.5% of 2 MiB
-transfers, independent of concurrency and VRAM allocation mode, while the reverse
-direction (`READ_FIXED`) is reliable. Reproduce with
-`tools/repro_iou_dmabuf_p2p.c` (no LMCache) or the Python command in §6. Next
-best experiment: swap the amdgpu VRAM source for a `udmabuf` (host) source to
-localize the defect to the amdgpu exporter vs the nvme-pci importer.
+exported AMD VRAM (`WRITE_FIXED`) delivers stale bytes — ~0.3–0.5% of 2 MiB
+transfers through the full LMCache stack, and **~50% in a minimal standalone C
+repro, including with only one `WRITE_FIXED` in flight at a time** — while the
+reverse direction (`READ_FIXED`) is reliable, and VRAM allocation mode (coarse
+vs fine-grained) makes no difference. The concurrency=1 standalone result rules
+out any form of concurrency, LMCache-level or otherwise, as a contributing
+factor. Reproduce with `tools/repro_iou_dmabuf_p2p.c` (no LMCache; builds with
+plain `cc` against `libamdhip64`, no HIP dev headers needed) or the Python
+command in §6. Next best experiment: swap the amdgpu VRAM source for a
+`udmabuf` (host) source to localize the defect to the amdgpu exporter vs the
+nvme-pci importer.

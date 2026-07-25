@@ -1,13 +1,38 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""One-shot diagnostic: is the concurrent-write corruption AMD peer-DMA coherency?
+"""One-shot diagnostic: does VRAM allocation mode (coarse vs fine-grained) affect
+WRITE_FIXED correctness?
 
-The io_uring DMA-BUF backend corrupts data under concurrent writes (serialized
-writes are clean). The write/slot/index/ring logic is correct and serialized, and
-the number of concurrent DMAs is the same regardless of caller threads -- so the
-remaining suspect is GPU->NVMe (peer PCIe) *visibility*: for coarse-grained VRAM
-(``torch.empty`` / ``hipMalloc``) a stream sync does not guarantee the GPU's writes
-are visible to the NVMe's peer DMA, so a bursty write reads stale VRAM.
+CORRECTED FRAMING (see docs/design/v1/storage_backend/iou_dmabuf_debug_log.md for
+the full, current history -- read that file first, not this docstring, for the
+up-to-date understanding). Earlier revisions of this docstring described the
+problem as "concurrent-write corruption" and implied WRITE_FIXED was the broken
+direction. Both were wrong:
+
+- It is not a concurrency effect. The corruption (in whichever direction is
+  actually broken) reproduces even with exactly one op in flight at a time.
+- Direct, per-direction isolation (``tools/repro_iou_dmabuf_p2p.c --mode
+  write`` / ``--mode read``, using plain O_DIRECT pread()/pwrite() as ground
+  truth on the side not under test) later showed WRITE_FIXED is clean and
+  READ_FIXED (NVMe peer-DMA *writing into* VRAM) is the broken direction --
+  the reverse of what this tool's original framing assumed.
+
+This tool's actual mechanism -- coarse (``hipMalloc``) vs fine-grained
+(``hipExtMallocWithFlags``) VRAM as the WRITE_FIXED source, through the real
+``RawBlockDevice`` write path -- remains a valid, useful data point: it showed
+both memory types corrupt at statistically similar rates when this ran
+(``--concurrency 8``), which was later folded into the broader finding that VRAM
+allocation mode does not explain the defect. But because WRITE_FIXED itself is
+now believed clean when isolated, and this tool only ever exercises
+WRITE_FIXED (never READ_FIXED) and only via a round-trip-adjacent path, do not
+treat its "coarse vs fine" verdict below as authoritative on its own -- prefer
+``tools/repro_iou_dmabuf_p2p.c --mode read`` for isolating the actual broken
+direction, and re-run the coarse/fine A/B specifically on READ_FIXED before
+citing memory-mode independence as settled for that direction.
+
+Also untested by this tool: the ``hipMemRangeFlagDmaBufMappingTypePcie`` export
+flag (see ``--mem-range-flags`` in the C reproducer). Every run recorded so far,
+including this tool's, exported with the default/unspecified mapping type.
 
 This drives the REAL dmabuf write path (the same ``RawBlockDevice`` the backend
 uses) against two source-memory types with an identical GPU fill and read-back:
@@ -19,7 +44,7 @@ For each: fill N chunks on the GPU (hipMemset + hipDeviceSynchronize), fire N
 concurrent WRITE_FIXED to N device slots, then serially READ_FIXED each slot back
 and check the bytes. Repeat, and report corruption counts per memory type.
 
-Verdict:
+Verdict (as originally designed -- read the corrected framing above first):
     coarse corrupts, fine clean  -> peer-DMA coherency; fix = fine-grained pool.
     both clean                   -> not reproduced at this size (raise --repeat/-N).
     both corrupt                 -> not (only) coherency; deeper issue.

@@ -32,11 +32,40 @@
 // (concurrency does not apply to them -- concurrency was already ruled out
 // separately; see the debug log). Only `roundtrip` honors --concurrency.
 //
-// Output is a per-mode corrupt count plus an interpretation line that maps
-// directly to the three failure hypotheses:
-//   write>0, read==0  -> WRITE_FIXED is broken (NVMe reading VRAM)
-//   write==0, read>0  -> READ_FIXED is broken (NVMe writing VRAM)
-//   both>0            -> both directions are broken
+// STRICT ACCOUNTING. Every check on `write`/`read` is classified into exactly
+// one bucket, never silently folded into another:
+//   ok                  transport completed fully AND every byte matched
+//   mismatch            transport completed fully but content was wrong
+//   io_short            io_uring op completed with fewer bytes than requested
+//                        (content not compared -- a short transfer proves nothing
+//                        about the untransferred region)
+//   io_error            io_uring op returned a negative, non-EAGAIN error
+//                        (content not compared)
+//   io_eagain_exhausted gave up after EAGAIN_CAP reissues (content not compared)
+//   harness_error       the plain pread()/pwrite() ground-truth syscall itself
+//                        failed or was short -- a test-harness problem, not
+//                        evidence about the dma-buf path
+// This matters because a transport-level failure and a genuine data mismatch
+// are different findings; conflating them would make "N corrupt" ambiguous
+// between "N times the bytes were wrong" and "N times something errored".
+//
+// --mem-range-flags F : passed as the final argument to
+// hipMemGetHandleForAddressRange for BOTH the source and dest exports (0 =
+// default/unspecified mapping; 1 = hipMemRangeHandleTypeDmaBufFd's PCIe mapping
+// type, hipMemRangeFlagDmaBufMappingTypePcie, intended for peer-device access).
+// All decisive runs recorded in the debug log before this option existed used
+// flags=0 -- the PCIe mapping mode was never exercised. Test both.
+//
+// Output is a per-mode breakdown (all six buckets) plus an interpretation line
+// that maps directly to the three failure hypotheses, based on ok/mismatch
+// only (io_short/io_error/io_eagain_exhausted/harness_error chunks are excluded
+// from that classification and reported separately so they cannot masquerade
+// as either a clean result or a data mismatch):
+//   write mismatch>0, read mismatch==0  -> WRITE_FIXED is broken (NVMe reading VRAM)
+//   write mismatch==0, read mismatch>0  -> READ_FIXED is broken (NVMe writing VRAM)
+//   both>0                              -> both directions are broken
+// Exit status is nonzero if any active mode recorded a mismatch or a non-EAGAIN
+// transport failure, so the tool is script/CI-usable.
 //
 // BUILD (host-only; no HIP dev headers or hipcc needed -- links libamdhip64):
 //   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
@@ -56,9 +85,18 @@
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read  --device-offset $((4<<30))
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 1   # roundtrip still corrupts
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --finegrained     # fine-grained VRAM
+//   # test the untested variable: export with the PCIe P2P mapping flag
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --mem-range-flags 1 \
+//       --device-offset $((4<<30))
 //
 // Requires: a kernel with CONFIG_DMABUF_TOKEN and an NVMe device whose driver
-// implements the dma-buf token op (nvme-pci), and ROCm >= 5.6.
+// implements the dma-buf token op (nvme-pci), and a ROCm version whose
+// libamdhip64 exposes hipMemGetHandleForAddressRange. The minimum version
+// varies by AMD documentation revision (reported anywhere from ROCm 5.6 to HIP
+// 7.0 depending on source); verify against your installed ROCm's release notes
+// rather than trusting either figure -- if the symbol is missing, _HipDriver's
+// constructor (in the Python tools) or the direct hipMemGetHandleForAddressRange
+// call here will fail loudly with a clear error either way.
 
 #define _GNU_SOURCE  // expose O_DIRECT from <fcntl.h>
 #include <errno.h>
@@ -143,6 +181,45 @@ struct repro_regbuf_desc {
 #define SRC_IDX 0
 #define DST_IDX 1
 
+// Strict per-check classification (see the file header). Transport-level
+// outcomes (IO_SHORT/IO_ERROR/IO_EAGAIN_EXHAUSTED) and the harness's own
+// ground-truth syscall failing (IO_HARNESS_ERROR) are never folded into
+// IO_MISMATCH: a mismatch means "the transport completed fully and correctly
+// but the bytes were wrong," which is the specific claim under test.
+enum io_result {
+    IO_OK = 0,
+    IO_SHORT,
+    IO_ERROR,
+    IO_EAGAIN_EXHAUSTED,
+    IO_HARNESS_ERROR,
+    IO_MISMATCH,
+};
+
+struct mode_stats {
+    long ok;
+    long mismatch;
+    long io_short;
+    long io_error;
+    long io_eagain_exhausted;
+    long harness_error;
+};
+
+static void stats_record(struct mode_stats *s, enum io_result r) {
+    switch (r) {
+        case IO_OK: s->ok++; break;
+        case IO_MISMATCH: s->mismatch++; break;
+        case IO_SHORT: s->io_short++; break;
+        case IO_ERROR: s->io_error++; break;
+        case IO_EAGAIN_EXHAUSTED: s->io_eagain_exhausted++; break;
+        case IO_HARNESS_ERROR: s->harness_error++; break;
+    }
+}
+
+static long stats_total(const struct mode_stats *s) {
+    return s->ok + s->mismatch + s->io_short + s->io_error +
+           s->io_eagain_exhausted + s->harness_error;
+}
+
 #define HIP_CHECK(call)                                                       \
     do {                                                                      \
         hipError_t _e = (call);                                               \
@@ -161,18 +238,24 @@ static int io_uring_register_raw(int ring_fd, unsigned opcode, void *arg,
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
-// Export [ptr, ptr+size) as a dma-buf fd.
-static int export_dmabuf(void *ptr, size_t size) {
+// Export [ptr, ptr+size) as a dma-buf fd. `mem_range_flags` is passed through
+// unchanged to hipMemGetHandleForAddressRange -- 0 for the default/unspecified
+// mapping, 1 for hipMemRangeFlagDmaBufMappingTypePcie (the PCIe P2P mapping
+// mode). All decisive runs recorded before --mem-range-flags existed used 0.
+static int export_dmabuf(void *ptr, size_t size, unsigned long long mem_range_flags) {
     int fd = -1;
     hipError_t e = hipMemGetHandleForAddressRange(
-        &fd, (hipDeviceptr_t)ptr, size, hipMemRangeHandleTypeDmaBufFd, 0);
+        &fd, (hipDeviceptr_t)ptr, size, hipMemRangeHandleTypeDmaBufFd,
+        mem_range_flags);
     if (e != hipSuccess) {
-        fprintf(stderr, "hipMemGetHandleForAddressRange failed: %d (%s)\n", e,
-                hipGetErrorString(e));
+        fprintf(stderr,
+                "hipMemGetHandleForAddressRange failed: %d (%s) [flags=%llu]\n",
+                e, hipGetErrorString(e), mem_range_flags);
         exit(1);
     }
     if (fd < 0) {
-        fprintf(stderr, "export returned invalid fd\n");
+        fprintf(stderr, "export returned invalid fd [flags=%llu]\n",
+                mem_range_flags);
         exit(1);
     }
     return fd;
@@ -205,11 +288,20 @@ struct opts {
     int do_roundtrip;
     int do_write_only;
     int do_read_only;
+    unsigned long long mem_range_flags;
 };
 
 // Submit N WRITE_FIXED (src chunk c -> device slot c), <= concurrency in flight,
-// reissuing on -EAGAIN. Returns 0 on success.
-static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o) {
+// reissuing on -EAGAIN. Transport-level short/error outcomes are logged to
+// stderr with the chunk index (io_uring completions can arrive out of
+// submission order under concurrency, so there is no single "which chunks
+// failed" list to report structurally here; short/error is rare enough in
+// practice that a stderr line is sufficient for roundtrip mode, which is
+// explicitly the non-decisive, non-strictly-accounted mode -- see the file
+// header). Returns the number of chunks that never completed (0 in the
+// overwhelmingly common case); nonzero means EAGAIN_CAP was exhausted for the
+// whole batch and the caller should not trust any of this repeat's data.
+static int run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o) {
     int done = 0, next = 0, inflight = 0;
     long eagain = 0;
     const size_t chunk = o->chunk_bytes;
@@ -218,7 +310,7 @@ static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o)
             fprintf(stderr, "run_writes: gave up after %ld EAGAINs "
                             "(done=%d/%d)\n",
                     eagain, done, o->num_chunks);
-            return;
+            return o->num_chunks - done;
         }
         while (inflight < o->concurrency && next < o->num_chunks) {
             struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
@@ -264,11 +356,14 @@ static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o)
             done++;
         }
     }
+    return 0;  // all num_chunks completed (short/error already logged above)
 }
 
-// Read one slot back into the dest dma-buf, reissuing on -EAGAIN.
-static void read_slot(struct io_uring *ring, int nvme_fd, uint64_t device_offset,
-                      size_t chunk) {
+// Read one slot back into the dest dma-buf, reissuing on -EAGAIN. Returns the
+// transport outcome (see enum io_result); does not compare content -- that is
+// the caller's job once it has confirmed IO_OK.
+static enum io_result read_slot(struct io_uring *ring, int nvme_fd,
+                                uint64_t device_offset, size_t chunk) {
     for (int tries = 0; tries < EAGAIN_CAP; tries++) {
         struct io_uring_sqe *sqe;
         while (!(sqe = io_uring_get_sqe(ring))) io_uring_submit(ring);
@@ -284,21 +379,31 @@ static void read_slot(struct io_uring *ring, int nvme_fd, uint64_t device_offset
         int res = cqe->res;
         io_uring_cqe_seen(ring, cqe);
         if (res == -EAGAIN) continue;
-        if (res < 0)
+        if (res < 0) {
             fprintf(stderr, "READ_FIXED @%llu: %s\n",
                     (unsigned long long)device_offset, strerror(-res));
-        return;
+            return IO_ERROR;
+        }
+        if ((size_t)res != chunk) {
+            fprintf(stderr, "short READ_FIXED @%llu: %d/%zu\n",
+                    (unsigned long long)device_offset, res, chunk);
+            return IO_SHORT;
+        }
+        return IO_OK;
     }
     fprintf(stderr, "READ_FIXED @%llu: gave up after %d EAGAINs\n",
             (unsigned long long)device_offset, EAGAIN_CAP);
+    return IO_EAGAIN_EXHAUSTED;
 }
 
 // Submit a single WRITE_FIXED (src slot, offset dmabuf_off) and wait for it,
 // reissuing on -EAGAIN. Unlike run_writes, exactly one op is ever in flight --
 // used by the write-only isolation check, where concurrency is deliberately not
 // exercised (concurrency was already ruled out as a factor; see the debug log).
-static void write_fixed_one(struct io_uring *ring, int nvme_fd, uint64_t dmabuf_off,
-                            size_t chunk, uint64_t device_offset) {
+// Returns the transport outcome; does not compare content.
+static enum io_result write_fixed_one(struct io_uring *ring, int nvme_fd,
+                                      uint64_t dmabuf_off, size_t chunk,
+                                      uint64_t device_offset) {
     for (int tries = 0; tries < EAGAIN_CAP; tries++) {
         struct io_uring_sqe *sqe;
         while (!(sqe = io_uring_get_sqe(ring))) io_uring_submit(ring);
@@ -314,65 +419,79 @@ static void write_fixed_one(struct io_uring *ring, int nvme_fd, uint64_t dmabuf_
         int res = cqe->res;
         io_uring_cqe_seen(ring, cqe);
         if (res == -EAGAIN) continue;
-        if (res < 0)
+        if (res < 0) {
             fprintf(stderr, "WRITE_FIXED @%llu: %s\n",
                     (unsigned long long)device_offset, strerror(-res));
-        else if ((size_t)res != chunk)
+            return IO_ERROR;
+        }
+        if ((size_t)res != chunk) {
             fprintf(stderr, "short WRITE_FIXED @%llu: %d/%zu\n",
                     (unsigned long long)device_offset, res, chunk);
-        return;
+            return IO_SHORT;
+        }
+        return IO_OK;
     }
     fprintf(stderr, "WRITE_FIXED @%llu: gave up after %d EAGAINs\n",
             (unsigned long long)device_offset, EAGAIN_CAP);
+    return IO_EAGAIN_EXHAUSTED;
 }
 
 // Isolates WRITE_FIXED. GPU-fill chunk `c`, WRITE_FIXED it to NVMe, then verify
 // with a PLAIN O_DIRECT pread() -- no io_uring, no dma-buf -- reading back what
 // actually landed on disk. A mismatch means WRITE_FIXED (NVMe peer-DMA reading
 // exported VRAM) corrupted the outbound transfer; READ_FIXED is not involved.
-// Returns 1 if corrupt, 0 if clean.
-static int check_write_only(struct io_uring *ring, int nvme_fd, void *src, int c,
-                            size_t chunk, uint64_t device_offset,
-                            unsigned char *pread_buf, int val) {
+// Returns the strict classification (see enum io_result / the file header): a
+// transport failure (IO_SHORT/IO_ERROR/IO_EAGAIN_EXHAUSTED) or ground-truth
+// pread() failure (IO_HARNESS_ERROR) is never reported as IO_MISMATCH.
+static enum io_result check_write_only(struct io_uring *ring, int nvme_fd,
+                                       void *src, int c, size_t chunk,
+                                       uint64_t device_offset,
+                                       unsigned char *pread_buf, int val) {
     HIP_CHECK(hipMemset((char *)src + (size_t)c * chunk, val, chunk));
     HIP_CHECK(hipDeviceSynchronize());
 
-    write_fixed_one(ring, nvme_fd, (uint64_t)c * chunk, chunk,
-                    device_offset + (uint64_t)c * chunk);
+    enum io_result wr = write_fixed_one(ring, nvme_fd, (uint64_t)c * chunk, chunk,
+                                        device_offset + (uint64_t)c * chunk);
+    if (wr != IO_OK) return wr;
 
     ssize_t n = pread(nvme_fd, pread_buf, chunk,
                       device_offset + (uint64_t)c * chunk);
     if (n != (ssize_t)chunk) {
         fprintf(stderr, "pread chunk %d: got %zd want %zu (%s)\n", c, n, chunk,
                 n < 0 ? strerror(errno) : "short read");
-        return 1;
+        return IO_HARNESS_ERROR;
     }
     for (size_t i = 0; i < chunk; i++)
-        if (pread_buf[i] != (unsigned char)val) return 1;
-    return 0;
+        if (pread_buf[i] != (unsigned char)val) return IO_MISMATCH;
+    return IO_OK;
 }
 
 // Isolates READ_FIXED. A PLAIN O_DIRECT pwrite() -- no io_uring, no dma-buf --
 // puts a known-good pattern directly on disk (WRITE_FIXED is not involved), then
 // READ_FIXED fetches it into the dest dma-buf, which is copied to host and
 // compared. A mismatch means READ_FIXED (NVMe peer-DMA writing exported VRAM)
-// corrupted the inbound transfer. Returns 1 if corrupt, 0 if clean.
-static int check_read_only(struct io_uring *ring, int nvme_fd, void *dst,
-                           size_t chunk, uint64_t device_offset,
-                           unsigned char *pwrite_buf, unsigned char *host, int val) {
+// corrupted the inbound transfer. Returns the strict classification (see enum
+// io_result / the file header): a transport failure or ground-truth pwrite()
+// failure is never reported as IO_MISMATCH.
+static enum io_result check_read_only(struct io_uring *ring, int nvme_fd,
+                                      void *dst, size_t chunk,
+                                      uint64_t device_offset,
+                                      unsigned char *pwrite_buf,
+                                      unsigned char *host, int val) {
     memset(pwrite_buf, (unsigned char)val, chunk);
     ssize_t n = pwrite(nvme_fd, pwrite_buf, chunk, device_offset);
     if (n != (ssize_t)chunk) {
         fprintf(stderr, "pwrite @%llu: got %zd want %zu (%s)\n",
                 (unsigned long long)device_offset, n, chunk,
                 n < 0 ? strerror(errno) : "short write");
-        return 1;
+        return IO_HARNESS_ERROR;
     }
-    read_slot(ring, nvme_fd, device_offset, chunk);
+    enum io_result rd = read_slot(ring, nvme_fd, device_offset, chunk);
+    if (rd != IO_OK) return rd;
     HIP_CHECK(hipMemcpy(host, dst, chunk, hipMemcpyDeviceToHost));
     for (size_t i = 0; i < chunk; i++)
-        if (host[i] != (unsigned char)val) return 1;
-    return 0;
+        if (host[i] != (unsigned char)val) return IO_MISMATCH;
+    return IO_OK;
 }
 
 int main(int argc, char **argv) {
@@ -388,10 +507,13 @@ int main(int argc, char **argv) {
         .do_roundtrip = 1,
         .do_write_only = 1,
         .do_read_only = 1,
+        .mem_range_flags = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc)
             o.device = argv[++i];
+        else if (!strcmp(argv[i], "--mem-range-flags") && i + 1 < argc)
+            o.mem_range_flags = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--num-chunks") && i + 1 < argc)
             o.num_chunks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--chunk-bytes") && i + 1 < argc)
@@ -445,8 +567,8 @@ int main(int argc, char **argv) {
     size_t pool = (size_t)o.num_chunks * o.chunk_bytes;
     void *src = gpu_alloc_aligned(pool, o.finegrained, page, &src_raw);
     void *dst = gpu_alloc_aligned(o.chunk_bytes, o.finegrained, page, &dst_raw);
-    int src_fd = export_dmabuf(src, pool);
-    int dst_fd = export_dmabuf(dst, o.chunk_bytes);
+    int src_fd = export_dmabuf(src, pool, o.mem_range_flags);
+    int dst_fd = export_dmabuf(dst, o.chunk_bytes, o.mem_range_flags);
 
     int nvme_fd = open(o.device, O_RDWR | O_DIRECT);
     if (nvme_fd < 0) {
@@ -496,10 +618,10 @@ int main(int argc, char **argv) {
     }
 
     printf("device=%s chunks=%d chunk=%zuKiB concurrency=%d repeat=%d "
-           "mem=%s dev_off=%llu mode=%s%s%s\n\n",
+           "mem=%s dev_off=%llu mem_range_flags=%llu mode=%s%s%s\n\n",
            o.device, o.num_chunks, o.chunk_bytes / 1024, o.concurrency, o.repeat,
            o.finegrained ? "fine-grained" : "coarse",
-           (unsigned long long)o.device_offset,
+           (unsigned long long)o.device_offset, o.mem_range_flags,
            o.do_roundtrip ? "roundtrip," : "",
            o.do_write_only ? "write," : "",
            o.do_read_only ? "read," : "");
@@ -520,7 +642,7 @@ int main(int argc, char **argv) {
     unsigned char *host = malloc(o.chunk_bytes);
     if (!host) { perror("malloc"); return 1; }
 
-    long roundtrip_corrupt = 0, write_only_corrupt = 0, read_only_corrupt = 0;
+    struct mode_stats roundtrip_stats = {0}, write_stats = {0}, read_stats = {0};
     long detail_printed = 0;
     const long DETAIL_CAP = 16;
 
@@ -534,24 +656,48 @@ int main(int argc, char **argv) {
             }
             HIP_CHECK(hipDeviceSynchronize());
 
-            run_writes(&ring, nvme_fd, &o);
-
-            for (int c = 0; c < o.num_chunks; c++) {
-                read_slot(&ring, nvme_fd,
-                         o.device_offset + (uint64_t)c * o.chunk_bytes,
-                         o.chunk_bytes);
-                HIP_CHECK(hipMemcpy(host, dst, o.chunk_bytes, hipMemcpyDeviceToHost));
-                int want = ((rep * 131 + c * 7) % 254) + 1;
-                // Sample start / middle / end (corruption spans blocks, not 1 byte).
-                unsigned char a = host[0];
-                unsigned char b = host[o.chunk_bytes / 2];
-                unsigned char e = host[o.chunk_bytes - 1];
-                if (a != want || b != want || e != want) {
-                    roundtrip_corrupt++;
-                    if (detail_printed++ < DETAIL_CAP)
-                        printf("  [roundtrip] rep %d chunk %d: want 0x%02x got "
-                               "0x%02x/0x%02x/0x%02x\n",
-                               rep, c, want, a, b, e);
+            int incomplete = run_writes(&ring, nvme_fd, &o);
+            if (incomplete > 0) {
+                // The write phase never confirmed every chunk landed; nothing in
+                // this repeat's device state is trustworthy. Do not read/compare
+                // it -- that would either wrongly count a never-written chunk as
+                // "mismatch", or wrongly count it as "ok" if stale data happens
+                // to match.
+                fprintf(stderr,
+                        "[roundtrip] rep %d: %d/%d writes never completed -- "
+                        "skipping read/compare for this repeat\n",
+                        rep, incomplete, o.num_chunks);
+                for (int i = 0; i < o.num_chunks; i++)
+                    stats_record(&roundtrip_stats, IO_EAGAIN_EXHAUSTED);
+            } else {
+                for (int c = 0; c < o.num_chunks; c++) {
+                    enum io_result rd = read_slot(
+                        &ring, nvme_fd, o.device_offset + (uint64_t)c * o.chunk_bytes,
+                        o.chunk_bytes);
+                    if (rd != IO_OK) {
+                        stats_record(&roundtrip_stats, rd);
+                        if (detail_printed++ < DETAIL_CAP)
+                            printf("  [roundtrip] rep %d chunk %d: transport "
+                                   "failure (not a data check)\n",
+                                   rep, c);
+                        continue;
+                    }
+                    HIP_CHECK(hipMemcpy(host, dst, o.chunk_bytes, hipMemcpyDeviceToHost));
+                    int want = ((rep * 131 + c * 7) % 254) + 1;
+                    // Sample start/middle/end (corruption spans blocks, not 1 byte;
+                    // roundtrip is the legacy, non-strict mode -- see file header).
+                    unsigned char a = host[0];
+                    unsigned char b = host[o.chunk_bytes / 2];
+                    unsigned char e = host[o.chunk_bytes - 1];
+                    if (a != want || b != want || e != want) {
+                        stats_record(&roundtrip_stats, IO_MISMATCH);
+                        if (detail_printed++ < DETAIL_CAP)
+                            printf("  [roundtrip] rep %d chunk %d: want 0x%02x got "
+                                   "0x%02x/0x%02x/0x%02x\n",
+                                   rep, c, want, a, b, e);
+                    } else {
+                        stats_record(&roundtrip_stats, IO_OK);
+                    }
                 }
             }
         }
@@ -559,36 +705,49 @@ int main(int argc, char **argv) {
         if (o.do_write_only) {
             for (int c = 0; c < o.num_chunks; c++) {
                 int val = ((rep * 131 + c * 7) % 254) + 1;
-                if (check_write_only(&ring, nvme_fd, src, c, o.chunk_bytes,
-                                     o.device_offset, pread_buf, val)) {
-                    write_only_corrupt++;
-                    if (detail_printed++ < DETAIL_CAP)
-                        printf("  [write-only] rep %d chunk %d: pread saw wrong "
-                               "bytes on disk (want 0x%02x)\n",
-                               rep, c, val);
-                }
+                enum io_result r = check_write_only(&ring, nvme_fd, src, c,
+                                                    o.chunk_bytes, o.device_offset,
+                                                    pread_buf, val);
+                stats_record(&write_stats, r);
+                if (r != IO_OK && detail_printed++ < DETAIL_CAP)
+                    printf("  [write-only] rep %d chunk %d: %s (want 0x%02x)\n",
+                           rep, c,
+                           r == IO_MISMATCH ? "pread saw wrong bytes on disk"
+                           : r == IO_SHORT ? "WRITE_FIXED was short"
+                           : r == IO_ERROR ? "WRITE_FIXED errored"
+                           : r == IO_EAGAIN_EXHAUSTED ? "WRITE_FIXED EAGAIN-exhausted"
+                                                       : "pread ground-truth failed",
+                           val);
             }
         }
 
         if (o.do_read_only) {
             for (int c = 0; c < o.num_chunks; c++) {
                 int val = ((rep * 131 + c * 7 + 3) % 254) + 1;  // distinct stream
-                if (check_read_only(&ring, nvme_fd, dst, o.chunk_bytes,
-                                    o.device_offset + (uint64_t)c * o.chunk_bytes,
-                                    pwrite_buf, host, val)) {
-                    read_only_corrupt++;
-                    if (detail_printed++ < DETAIL_CAP)
-                        printf("  [read-only] rep %d chunk %d: VRAM saw wrong "
-                               "bytes after READ_FIXED (want 0x%02x)\n",
-                               rep, c, val);
-                }
+                enum io_result r = check_read_only(
+                    &ring, nvme_fd, dst, o.chunk_bytes,
+                    o.device_offset + (uint64_t)c * o.chunk_bytes, pwrite_buf, host,
+                    val);
+                stats_record(&read_stats, r);
+                if (r != IO_OK && detail_printed++ < DETAIL_CAP)
+                    printf("  [read-only] rep %d chunk %d: %s (want 0x%02x)\n",
+                           rep, c,
+                           r == IO_MISMATCH ? "VRAM saw wrong bytes after READ_FIXED"
+                           : r == IO_SHORT ? "READ_FIXED was short"
+                           : r == IO_ERROR ? "READ_FIXED errored"
+                           : r == IO_EAGAIN_EXHAUSTED ? "READ_FIXED EAGAIN-exhausted"
+                                                       : "pwrite ground-truth failed",
+                           val);
             }
         }
 
-        // Per-repeat progress so a long, silent run does not look hung.
-        printf("rep %d/%d done: roundtrip=%ld write-only=%ld read-only=%ld\n",
-               rep + 1, o.repeat, roundtrip_corrupt, write_only_corrupt,
-               read_only_corrupt);
+        // Per-repeat progress (mismatch counts only) so a long, silent run does
+        // not look hung. Full breakdown (including transport failures) is in the
+        // final summary.
+        printf("rep %d/%d done: roundtrip=%ld write-only=%ld read-only=%ld "
+               "(mismatch counts; see final summary for transport failures)\n",
+               rep + 1, o.repeat, roundtrip_stats.mismatch, write_stats.mismatch,
+               read_stats.mismatch);
         fflush(stdout);
     }
 
@@ -596,32 +755,52 @@ int main(int argc, char **argv) {
     printf("\n=== results (%d chunks x %d repeats = %ld checks per mode) ===\n",
            o.num_chunks, o.repeat, n);
     if (o.do_roundtrip)
-        printf("  roundtrip  corrupt: %5ld / %ld  (WRITE_FIXED then READ_FIXED; "
-               "does not isolate direction)\n",
-               roundtrip_corrupt, n);
+        printf("  roundtrip : ok=%ld mismatch=%ld short=%ld error=%ld "
+               "eagain_exhausted=%ld harness_error=%ld (total=%ld; does not "
+               "isolate direction)\n",
+               roundtrip_stats.ok, roundtrip_stats.mismatch, roundtrip_stats.io_short,
+               roundtrip_stats.io_error, roundtrip_stats.io_eagain_exhausted,
+               roundtrip_stats.harness_error, stats_total(&roundtrip_stats));
     if (o.do_write_only)
-        printf("  write-only corrupt: %5ld / %ld  (WRITE_FIXED verified via plain "
-               "pread -- isolates WRITE_FIXED)\n",
-               write_only_corrupt, n);
+        printf("  write-only: ok=%ld mismatch=%ld short=%ld error=%ld "
+               "eagain_exhausted=%ld harness_error=%ld (total=%ld; isolates "
+               "WRITE_FIXED)\n",
+               write_stats.ok, write_stats.mismatch, write_stats.io_short,
+               write_stats.io_error, write_stats.io_eagain_exhausted,
+               write_stats.harness_error, stats_total(&write_stats));
     if (o.do_read_only)
-        printf("  read-only  corrupt: %5ld / %ld  (plain pwrite verified via "
-               "READ_FIXED -- isolates READ_FIXED)\n",
-               read_only_corrupt, n);
+        printf("  read-only : ok=%ld mismatch=%ld short=%ld error=%ld "
+               "eagain_exhausted=%ld harness_error=%ld (total=%ld; isolates "
+               "READ_FIXED)\n",
+               read_stats.ok, read_stats.mismatch, read_stats.io_short,
+               read_stats.io_error, read_stats.io_eagain_exhausted,
+               read_stats.harness_error, stats_total(&read_stats));
 
+    int exit_status = 0;
     if (o.do_write_only && o.do_read_only) {
-        printf("\n=== interpretation ===\n");
-        if (write_only_corrupt > 0 && read_only_corrupt == 0)
+        printf("\n=== interpretation (mismatch counts only) ===\n");
+        if (write_stats.mismatch > 0 && read_stats.mismatch == 0)
             printf("  WRITE_FIXED is broken (NVMe peer-DMA READING VRAM). "
                    "READ_FIXED is clean.\n");
-        else if (write_only_corrupt == 0 && read_only_corrupt > 0)
+        else if (write_stats.mismatch == 0 && read_stats.mismatch > 0)
             printf("  READ_FIXED is broken (NVMe peer-DMA WRITING VRAM). "
                    "WRITE_FIXED is clean.\n");
-        else if (write_only_corrupt > 0 && read_only_corrupt > 0)
+        else if (write_stats.mismatch > 0 && read_stats.mismatch > 0)
             printf("  BOTH directions are broken.\n");
         else
-            printf("  Neither isolation check reproduced this run -- raise "
-                   "--repeat/--num-chunks, or rely on --mode roundtrip.\n");
+            printf("  Neither isolation check reproduced a mismatch this run -- "
+                   "raise --repeat/--num-chunks, or rely on --mode roundtrip.\n");
     }
+    if (roundtrip_stats.mismatch || roundtrip_stats.io_short ||
+        roundtrip_stats.io_error || roundtrip_stats.io_eagain_exhausted ||
+        roundtrip_stats.harness_error)
+        exit_status = 1;
+    if (write_stats.mismatch || write_stats.io_short || write_stats.io_error ||
+        write_stats.io_eagain_exhausted || write_stats.harness_error)
+        exit_status = 1;
+    if (read_stats.mismatch || read_stats.io_short || read_stats.io_error ||
+        read_stats.io_eagain_exhausted || read_stats.harness_error)
+        exit_status = 1;
 
     free(host);
     free(pread_buf);
@@ -632,5 +811,5 @@ int main(int argc, char **argv) {
     close(dst_fd);
     hipFree(src_raw);
     hipFree(dst_raw);
-    return 0;
+    return exit_status;
 }

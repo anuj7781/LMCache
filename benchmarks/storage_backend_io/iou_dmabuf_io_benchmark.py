@@ -270,8 +270,17 @@ class IouDmabufIOBenchmark:
 
         start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=self.write_concurrency) as ex:
-            for lo, hi in self._slices(self.write_concurrency):
+            # Capture the outer submit() futures too: if submit_slice itself
+            # raises (e.g. batched_submit_put_task raises), the exception lives
+            # only on this future. Discarding it (as bare ex.submit(...) calls
+            # would) lets a failed slice vanish silently -- the executor's
+            # __exit__ still waits for the thread, it just never re-raises.
+            outer_futures = [
                 ex.submit(submit_slice, lo, hi)
+                for lo, hi in self._slices(self.write_concurrency)
+            ]
+        for outer in outer_futures:
+            outer.result()
         for fut in futures:
             fut.result(timeout=300)
         return time.perf_counter() - start
@@ -289,12 +298,23 @@ class IouDmabufIOBenchmark:
             # batched_get_blocking returns [] on a total miss; normalize length.
             if not loaded:
                 loaded = [None] * len(batch)
+            # strict=True: a length mismatch means the backend silently
+            # truncated the batch. zip(..., strict=False) would drop the
+            # trailing keys from `results` without any error -- exactly the
+            # kind of silent data loss this integrity tool exists to catch.
             with lock:
-                results.extend(zip(batch, loaded, strict=False))
+                results.extend(zip(batch, loaded, strict=True))
 
         with ThreadPoolExecutor(max_workers=self.read_concurrency) as ex:
-            for lo, hi in self._slices(self.read_concurrency):
+            # See _write_phase: capture the outer futures so a read_slice
+            # exception (including the strict=True zip mismatch above) is not
+            # silently swallowed by the executor.
+            outer_futures = [
                 ex.submit(read_slice, lo, hi)
+                for lo, hi in self._slices(self.read_concurrency)
+            ]
+        for outer in outer_futures:
+            outer.result()
         return results
 
     def _verify(

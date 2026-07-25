@@ -117,6 +117,11 @@ struct repro_regbuf_desc {
     uint64_t __resv[6];
 };
 
+// Bounded -EAGAIN retries. dma-buf ops can legitimately return -EAGAIN a few
+// times (mapping invalidation); an unbounded loop would spin forever if it never
+// resolves. Cap it so the tool always terminates.
+#define EAGAIN_CAP 100000
+
 #define SRC_IDX 0
 #define DST_IDX 1
 
@@ -185,8 +190,15 @@ struct opts {
 // reissuing on -EAGAIN. Returns 0 on success.
 static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o) {
     int done = 0, next = 0, inflight = 0;
+    long eagain = 0;
     const size_t chunk = o->chunk_bytes;
     while (done < o->num_chunks) {
+        if (eagain > (long)o->num_chunks * EAGAIN_CAP) {
+            fprintf(stderr, "run_writes: gave up after %ld EAGAINs "
+                            "(done=%d/%d)\n",
+                    eagain, done, o->num_chunks);
+            return;
+        }
         while (inflight < o->concurrency && next < o->num_chunks) {
             struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
             if (!sqe) break;  // SQ full; drain first
@@ -211,6 +223,7 @@ static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o)
 
         if (res == -EAGAIN) {
             // dma-buf mapping was invalidated; reissue the same request unchanged.
+            eagain++;
             struct io_uring_sqe *sqe;
             while (!(sqe = io_uring_get_sqe(ring))) io_uring_submit(ring);
             io_uring_prep_write_fixed(
@@ -235,7 +248,7 @@ static void run_writes(struct io_uring *ring, int nvme_fd, const struct opts *o)
 // Read one slot back into the dest dma-buf, reissuing on -EAGAIN.
 static void read_slot(struct io_uring *ring, int nvme_fd, uint64_t device_offset,
                       size_t chunk) {
-    for (;;) {
+    for (int tries = 0; tries < EAGAIN_CAP; tries++) {
         struct io_uring_sqe *sqe;
         while (!(sqe = io_uring_get_sqe(ring))) io_uring_submit(ring);
         io_uring_prep_read_fixed(sqe, nvme_fd, (void *)0, chunk, device_offset,
@@ -250,12 +263,13 @@ static void read_slot(struct io_uring *ring, int nvme_fd, uint64_t device_offset
         int res = cqe->res;
         io_uring_cqe_seen(ring, cqe);
         if (res == -EAGAIN) continue;
-        if (res < 0) {
+        if (res < 0)
             fprintf(stderr, "READ_FIXED @%llu: %s\n",
                     (unsigned long long)device_offset, strerror(-res));
-        }
         return;
     }
+    fprintf(stderr, "READ_FIXED @%llu: gave up after %d EAGAINs\n",
+            (unsigned long long)device_offset, EAGAIN_CAP);
 }
 
 int main(int argc, char **argv) {
@@ -397,6 +411,10 @@ int main(int argc, char **argv) {
                            rep, c, want, a, b, e);
             }
         }
+        // Per-repeat progress so a long, silent run does not look hung.
+        printf("rep %d/%d done: %ld corrupt so far\n", rep + 1, o.repeat,
+               total_corrupt);
+        fflush(stdout);
     }
 
     printf("\ncorrupt %ld / %d chunks (%d chunks x %d repeats)\n", total_corrupt,

@@ -130,6 +130,7 @@ class IouDmabufIOBenchmark:
         gpu_pool_bytes: int,
         capacity_bytes: int,
         max_local_cpu_gb: float,
+        disk_io_threads: int = 4,
         verify_integrity: bool,
         iters: int = 1,
         target_gib: float = 0.0,
@@ -158,6 +159,7 @@ class IouDmabufIOBenchmark:
         self.iters = iters
         self.target_gib = target_gib
         self.max_local_cpu_gb = max_local_cpu_gb
+        self.disk_io_threads = disk_io_threads
         self.verify_integrity = verify_integrity
 
         self._chunk_shape = torch.Size(
@@ -193,6 +195,7 @@ class IouDmabufIOBenchmark:
             "iou_dmabuf.mem_range_flags": self.mem_range_flags,
             "iou_dmabuf.load_checkpoint_on_init": False,
             "iou_dmabuf.meta_enable_periodic": False,
+            "disk_io_threads": self.disk_io_threads,
         }
         if self.capacity_bytes > 0:
             extra["iou_dmabuf.capacity_bytes"] = self.capacity_bytes
@@ -590,6 +593,12 @@ def main() -> None:
     )
     parser.add_argument("--max-local-cpu-gb", type=float, default=1.0)
     parser.add_argument(
+        "--disk-io-threads",
+        type=int,
+        default=4,
+        help="backend I/O worker threads; 1 fully serializes the put/get path",
+    )
+    parser.add_argument(
         "--verify-integrity",
         action="store_true",
         help="read back and byte-compare against the written pattern",
@@ -610,6 +619,7 @@ def main() -> None:
         gpu_pool_bytes=args.gpu_pool_bytes,
         capacity_bytes=args.capacity_bytes,
         max_local_cpu_gb=args.max_local_cpu_gb,
+        disk_io_threads=args.disk_io_threads,
         verify_integrity=args.verify_integrity,
         iters=args.iters,
         target_gib=args.target_gib,

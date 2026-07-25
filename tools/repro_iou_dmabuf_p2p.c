@@ -42,6 +42,7 @@
 // Requires: a kernel with CONFIG_DMABUF_TOKEN and an NVMe device whose driver
 // implements the dma-buf token op (nvme-pci), and ROCm >= 5.6.
 
+#define _GNU_SOURCE  // expose O_DIRECT from <fcntl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <liburing.h>

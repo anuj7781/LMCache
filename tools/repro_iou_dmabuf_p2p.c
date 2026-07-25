@@ -23,11 +23,15 @@
 //
 // Expected on the affected stack: nonzero corruption, even at --concurrency 1.
 //
-// BUILD (ROCm):
-//   hipcc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring
-// or:
-//   cc  -O2 -D__HIP_PLATFORM_AMD__ -I/opt/rocm/include -o repro_iou_dmabuf_p2p \
-//       tools/repro_iou_dmabuf_p2p.c -L/opt/rocm/lib -lamdhip64 -luring
+// BUILD (host-only; no HIP dev headers or hipcc needed -- links libamdhip64):
+//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
+//      -L/opt/rocm/lib -lamdhip64
+//   # If -lamdhip64 is not found (runtime-only ROCm, no unversioned .so symlink),
+//   # link the versioned soname directly:
+//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
+//      "$(ls /opt/rocm*/lib/libamdhip64.so* 2>/dev/null | head -1)"
+//   # liburing dev headers: apt/dnf install liburing-dev (or point -I/-L at it).
+//   # ROCM_PATH may differ (e.g. /opt/rocm-6.x); adjust the lib path accordingly.
 //
 // RUN (WRITES ARE DESTRUCTIVE to the device at --device-offset; use scratch):
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --num-chunks 64 \
@@ -38,12 +42,9 @@
 // Requires: a kernel with CONFIG_DMABUF_TOKEN and an NVMe device whose driver
 // implements the dma-buf token op (nvme-pci), and ROCm >= 5.6.
 
-#include <hip/hip_runtime.h>
-
 #include <errno.h>
 #include <fcntl.h>
 #include <liburing.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,29 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// ---- Minimal HIP runtime API (host-only) ------------------------------------
+// Declared here so the repro builds against a runtime-only ROCm install
+// (libamdhip64.so) with a plain C compiler -- no HIP dev headers, no hipcc.
+// Values below are the stable public HIP ABI.
+typedef int hipError_t;
+typedef void *hipDeviceptr_t;
+enum { hipSuccess = 0 };
+enum { hipMemcpyDeviceToHost = 2 };
+enum { hipMemRangeHandleTypeDmaBufFd = 1 };
+#define hipDeviceMallocFinegrained 0x1
+
+extern hipError_t hipSetDevice(int deviceId);
+extern hipError_t hipMalloc(void **ptr, size_t size);
+extern hipError_t hipExtMallocWithFlags(void **ptr, size_t size, unsigned int flags);
+extern hipError_t hipFree(void *ptr);
+extern hipError_t hipMemset(void *dst, int value, size_t sizeBytes);
+extern hipError_t hipMemcpy(void *dst, const void *src, size_t sizeBytes, int kind);
+extern hipError_t hipDeviceSynchronize(void);
+extern hipError_t hipMemGetHandleForAddressRange(void *handle, hipDeviceptr_t dptr,
+                                                 size_t size, int handleType,
+                                                 unsigned long long flags);
+extern const char *hipGetErrorString(hipError_t err);
 
 // ---- io_uring dma-buf token ABI (patched kernel; define defensively) --------
 #ifndef IORING_REGISTER_BUFFERS2
@@ -91,11 +115,6 @@ struct repro_regbuf_desc {
     int32_t target_fd;  // the O_DIRECT block fd
     uint64_t __resv[6];
 };
-
-// ---- HIP dma-buf export bits (in ROCm >= 5.6 headers) -----------------------
-#ifndef hipDeviceMallocFinegrained
-#define hipDeviceMallocFinegrained 0x1
-#endif
 
 #define SRC_IDX 0
 #define DST_IDX 1

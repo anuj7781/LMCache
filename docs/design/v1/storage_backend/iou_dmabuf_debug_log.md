@@ -18,9 +18,11 @@ Established, with high confidence:
   `READ_FIXED` (NVMe peer-DMA *writes* VRAM) is clean at all concurrencies.
 - **Not concurrency.** Corrupts even with the entire put path serialized
   (`disk_io_threads=1`, one op at a time, nothing interleaving on the ring).
-- **Not LMCache code.** Reproduces through the raw Rust `RawBlockDevice`
-  (no `RawBlockCore`, no Python backend logic) and is expected to reproduce in
-  the standalone C program.
+- **Not LMCache code.** Reproduces through the raw Rust `RawBlockDevice` (no
+  `RawBlockCore`, no Python backend logic), and is **confirmed in the standalone
+  C program** `tools/repro_iou_dmabuf_p2p.c` (pure HIP + io_uring, no
+  LMCache/Python/Rust): **1298 / 2560 chunks corrupt (~50%)** at 8-way write
+  concurrency on `/dev/nvme0n1`, coarse VRAM (see §7.1).
 - **Not memory-coherency type.** Coarse-grained (`hipMalloc`) and fine-grained
   (`hipExtMallocWithFlags`) source VRAM both corrupt.
 - **Data signature:** "foreign" — the corrupt chunk holds stale/other data, not a
@@ -183,6 +185,40 @@ python benchmarks/storage_backend_io/iou_dmabuf_io_benchmark.py \
 Build & run instructions are in the file header. Vary `--concurrency` (1 still
 corrupts), `--finegrained`, `--repeat`, `--device-offset` (avoid LBA 0 for a
 non-destructive scratch region). See §8 for the destructive-write warning.
+
+Build (runtime-only ROCm — no HIP dev headers/hipcc needed; the program declares
+the HIP functions it uses and links `libamdhip64`):
+```
+cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
+   -L/opt/rocm/lib -lamdhip64
+```
+
+### 7.1 Confirmed run (2026-07-25)
+
+```
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 8 --repeat 40 \
+    --device-offset $((4<<30))
+# device=/dev/nvme0n1 chunks=64 chunk=2048KiB concurrency=8 repeat=40 mem=coarse
+# ...
+# corrupt 1298 / 2560 chunks (64 chunks x 40 repeats)
+# => REPRODUCED: io_uring dma-buf WRITE_FIXED (NVMe peer-DMA reading VRAM) corrupts.
+```
+
+- **~50% of 2 MiB chunks corrupt** at 8-way write concurrency — a far higher rate
+  than the full LMCache stack (~0.3–0.5%). Expected: the raw tool fires 8
+  concurrent `WRITE_FIXED` at one dmabuf, while the backend interleaves one
+  dmabuf write per chunk with header writes and slot bookkeeping, spacing the
+  peer reads out.
+- **Concurrent writes cross data:** distinct chunks read back the *same* wrong
+  value (e.g. chunk 0 and chunk 1 both returned `0xc1/0x29/0x01`), and many
+  chunks returned another chunk's value — consistent with peer-DMA reads of
+  exported VRAM returning stale/other data under concurrency.
+- Environment: AMD Radeon AI PRO R9700, runtime-only ROCm, coarse VRAM
+  (`hipMalloc`), `/dev/nvme0n1`, `--device-offset 4 GiB` (scratch).
+- **Still to capture:** a `--concurrency 1` run (LMCache data says it still
+  corrupts, at a lower rate); a `--finegrained` run (coherency-mode control); and
+  `dmesg` during a corrupting run. These strengthen the upstream report but the
+  core defect is already reproduced without LMCache.
 
 ---
 

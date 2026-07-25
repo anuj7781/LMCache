@@ -130,12 +130,12 @@ class IouDmabufIOBenchmark:
         gpu_pool_bytes: int,
         capacity_bytes: int,
         max_local_cpu_gb: float,
-        disk_io_threads: int = 4,
         verify_integrity: bool,
         iters: int = 1,
         target_gib: float = 0.0,
         write_concurrency: Optional[int] = None,
         read_concurrency: Optional[int] = None,
+        disk_io_threads: int = 4,
     ) -> None:
         self.device_path = device_path
         self.num_ops = num_ops

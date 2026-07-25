@@ -1,27 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Standalone reproducer: io_uring DMA-BUF WRITE_FIXED corruption on AMD VRAM.
+// Standalone reproducer: io_uring DMA-BUF corruption on AMD VRAM.
 //
-// No LMCache, no Python, no Rust. Pure HIP + io_uring. It reproduces the
-// data corruption observed when an NVMe device does peer-to-peer DMA that READS
-// exported AMD GPU VRAM (io_uring WRITE_FIXED), while the reverse direction
-// (READ_FIXED, NVMe writing VRAM) is clean.
+// No LMCache, no Python, no Rust. Pure HIP + io_uring.
 //
-// What it does, per repeat:
-//   1. hipMalloc (or hipExtMallocWithFlags fine-grained) a GPU source pool of N
-//      chunks and a 1-chunk GPU dest buffer.
-//   2. Export both as dma-buf fds via hipMemGetHandleForAddressRange.
-//   3. Open the NVMe device O_DIRECT, set up io_uring, register a sparse buffer
-//      table, and install the two dma-bufs with IORING_REGISTER_BUFFERS_UPDATE +
-//      IO_REGBUF_TYPE_DMABUF, bound to the NVMe fd.
-//   4. Fill each source chunk with a distinct byte (hipMemset) + hipDeviceSynchronize.
-//   5. Issue N WRITE_FIXED (src chunk c -> device slot c), up to --concurrency in
-//      flight, reissuing on -EAGAIN.
-//   6. Read every slot back (READ_FIXED into the dest dma-buf), copy dest->host,
-//      and check the bytes match what was written.
-//   7. Report corrupt-chunk count.
+// IMPORTANT -- direction isolation. A round trip (WRITE_FIXED then READ_FIXED)
+// cannot tell you which leg is broken: if the round trip returns wrong bytes, that
+// is equally consistent with (a) WRITE_FIXED corrupting VRAM->NVMe, (b) READ_FIXED
+// corrupting NVMe->VRAM, or (c) both. This tool runs three independent checks per
+// chunk, selectable with --mode (default: all three):
 //
-// Expected on the affected stack: nonzero corruption, even at --concurrency 1.
+//   roundtrip   : GPU fill -> WRITE_FIXED -> READ_FIXED -> compare.
+//                 (Legacy mode. Cannot isolate the direction; kept for continuity
+//                 with earlier runs and to measure --concurrency effects, which
+//                 only this mode exercises.)
+//   write       : GPU fill -> WRITE_FIXED -> plain O_DIRECT pread() (no io_uring,
+//                 no dma-buf) reads back what actually landed on disk. Isolates
+//                 whether WRITE_FIXED (NVMe peer-DMA READING VRAM) corrupts the
+//                 outbound transfer, independent of READ_FIXED.
+//   read        : plain O_DIRECT pwrite() (no io_uring, no dma-buf) puts known-good
+//                 bytes directly on disk, bypassing WRITE_FIXED -> READ_FIXED
+//                 fetches them into VRAM -> hipMemcpy to host -> compare. Isolates
+//                 whether READ_FIXED (NVMe peer-DMA WRITING VRAM) corrupts the
+//                 inbound transfer, independent of WRITE_FIXED.
+//
+// pread()/pwrite() on an O_DIRECT fd are a decades-old, well-established kernel
+// path, not the new dma-buf-token mechanism under test, so they serve as ground
+// truth for "what is actually on disk" / "what we actually asked to be written".
+//
+// The `write` and `read` isolation checks always run one operation at a time
+// (concurrency does not apply to them -- concurrency was already ruled out
+// separately; see the debug log). Only `roundtrip` honors --concurrency.
+//
+// Output is a per-mode corrupt count plus an interpretation line that maps
+// directly to the three failure hypotheses:
+//   write>0, read==0  -> WRITE_FIXED is broken (NVMe reading VRAM)
+//   write==0, read>0  -> READ_FIXED is broken (NVMe writing VRAM)
+//   both>0            -> both directions are broken
 //
 // BUILD (host-only; no HIP dev headers or hipcc needed -- links libamdhip64):
 //   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
@@ -36,7 +51,10 @@
 // RUN (WRITES ARE DESTRUCTIVE to the device at --device-offset; use scratch):
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --num-chunks 64 \
 //       --concurrency 8 --repeat 40 --device-offset $((4<<30))
-//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 1   # still corrupts
+//   # narrow to one direction (faster, and the direct answer to "which leg?"):
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode write --device-offset $((4<<30))
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read  --device-offset $((4<<30))
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 1   # roundtrip still corrupts
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --finegrained     # fine-grained VRAM
 //
 // Requires: a kernel with CONFIG_DMABUF_TOKEN and an NVMe device whose driver
@@ -184,6 +202,9 @@ struct opts {
     uint64_t device_offset;
     int finegrained;
     int device_index;
+    int do_roundtrip;
+    int do_write_only;
+    int do_read_only;
 };
 
 // Submit N WRITE_FIXED (src chunk c -> device slot c), <= concurrency in flight,
@@ -272,6 +293,88 @@ static void read_slot(struct io_uring *ring, int nvme_fd, uint64_t device_offset
             (unsigned long long)device_offset, EAGAIN_CAP);
 }
 
+// Submit a single WRITE_FIXED (src slot, offset dmabuf_off) and wait for it,
+// reissuing on -EAGAIN. Unlike run_writes, exactly one op is ever in flight --
+// used by the write-only isolation check, where concurrency is deliberately not
+// exercised (concurrency was already ruled out as a factor; see the debug log).
+static void write_fixed_one(struct io_uring *ring, int nvme_fd, uint64_t dmabuf_off,
+                            size_t chunk, uint64_t device_offset) {
+    for (int tries = 0; tries < EAGAIN_CAP; tries++) {
+        struct io_uring_sqe *sqe;
+        while (!(sqe = io_uring_get_sqe(ring))) io_uring_submit(ring);
+        io_uring_prep_write_fixed(sqe, nvme_fd, (void *)(uintptr_t)dmabuf_off, chunk,
+                                  device_offset, SRC_IDX);
+        io_uring_submit(ring);
+        struct io_uring_cqe *cqe;
+        int r = io_uring_wait_cqe(ring, &cqe);
+        if (r < 0) {
+            fprintf(stderr, "wait_cqe(write-only): %s\n", strerror(-r));
+            exit(1);
+        }
+        int res = cqe->res;
+        io_uring_cqe_seen(ring, cqe);
+        if (res == -EAGAIN) continue;
+        if (res < 0)
+            fprintf(stderr, "WRITE_FIXED @%llu: %s\n",
+                    (unsigned long long)device_offset, strerror(-res));
+        else if ((size_t)res != chunk)
+            fprintf(stderr, "short WRITE_FIXED @%llu: %d/%zu\n",
+                    (unsigned long long)device_offset, res, chunk);
+        return;
+    }
+    fprintf(stderr, "WRITE_FIXED @%llu: gave up after %d EAGAINs\n",
+            (unsigned long long)device_offset, EAGAIN_CAP);
+}
+
+// Isolates WRITE_FIXED. GPU-fill chunk `c`, WRITE_FIXED it to NVMe, then verify
+// with a PLAIN O_DIRECT pread() -- no io_uring, no dma-buf -- reading back what
+// actually landed on disk. A mismatch means WRITE_FIXED (NVMe peer-DMA reading
+// exported VRAM) corrupted the outbound transfer; READ_FIXED is not involved.
+// Returns 1 if corrupt, 0 if clean.
+static int check_write_only(struct io_uring *ring, int nvme_fd, void *src, int c,
+                            size_t chunk, uint64_t device_offset,
+                            unsigned char *pread_buf, int val) {
+    HIP_CHECK(hipMemset((char *)src + (size_t)c * chunk, val, chunk));
+    HIP_CHECK(hipDeviceSynchronize());
+
+    write_fixed_one(ring, nvme_fd, (uint64_t)c * chunk, chunk,
+                    device_offset + (uint64_t)c * chunk);
+
+    ssize_t n = pread(nvme_fd, pread_buf, chunk,
+                      device_offset + (uint64_t)c * chunk);
+    if (n != (ssize_t)chunk) {
+        fprintf(stderr, "pread chunk %d: got %zd want %zu (%s)\n", c, n, chunk,
+                n < 0 ? strerror(errno) : "short read");
+        return 1;
+    }
+    for (size_t i = 0; i < chunk; i++)
+        if (pread_buf[i] != (unsigned char)val) return 1;
+    return 0;
+}
+
+// Isolates READ_FIXED. A PLAIN O_DIRECT pwrite() -- no io_uring, no dma-buf --
+// puts a known-good pattern directly on disk (WRITE_FIXED is not involved), then
+// READ_FIXED fetches it into the dest dma-buf, which is copied to host and
+// compared. A mismatch means READ_FIXED (NVMe peer-DMA writing exported VRAM)
+// corrupted the inbound transfer. Returns 1 if corrupt, 0 if clean.
+static int check_read_only(struct io_uring *ring, int nvme_fd, void *dst,
+                           size_t chunk, uint64_t device_offset,
+                           unsigned char *pwrite_buf, unsigned char *host, int val) {
+    memset(pwrite_buf, (unsigned char)val, chunk);
+    ssize_t n = pwrite(nvme_fd, pwrite_buf, chunk, device_offset);
+    if (n != (ssize_t)chunk) {
+        fprintf(stderr, "pwrite @%llu: got %zd want %zu (%s)\n",
+                (unsigned long long)device_offset, n, chunk,
+                n < 0 ? strerror(errno) : "short write");
+        return 1;
+    }
+    read_slot(ring, nvme_fd, device_offset, chunk);
+    HIP_CHECK(hipMemcpy(host, dst, chunk, hipMemcpyDeviceToHost));
+    for (size_t i = 0; i < chunk; i++)
+        if (host[i] != (unsigned char)val) return 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct opts o = {
         .device = NULL,
@@ -282,6 +385,9 @@ int main(int argc, char **argv) {
         .device_offset = 0,
         .finegrained = 0,
         .device_index = 0,
+        .do_roundtrip = 1,
+        .do_write_only = 1,
+        .do_read_only = 1,
     };
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc)
@@ -300,7 +406,22 @@ int main(int argc, char **argv) {
             o.finegrained = 1;
         else if (!strcmp(argv[i], "--device-index") && i + 1 < argc)
             o.device_index = atoi(argv[++i]);
-        else {
+        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            o.do_roundtrip = o.do_write_only = o.do_read_only = 0;
+            if (!strcmp(m, "all"))
+                o.do_roundtrip = o.do_write_only = o.do_read_only = 1;
+            else if (!strcmp(m, "roundtrip"))
+                o.do_roundtrip = 1;
+            else if (!strcmp(m, "write"))
+                o.do_write_only = 1;
+            else if (!strcmp(m, "read"))
+                o.do_read_only = 1;
+            else {
+                fprintf(stderr, "--mode must be one of: all, roundtrip, write, read\n");
+                return 2;
+            }
+        } else {
             fprintf(stderr, "unknown/incomplete arg: %s\n", argv[i]);
             return 2;
         }
@@ -375,57 +496,136 @@ int main(int argc, char **argv) {
     }
 
     printf("device=%s chunks=%d chunk=%zuKiB concurrency=%d repeat=%d "
-           "mem=%s dev_off=%llu\n\n",
+           "mem=%s dev_off=%llu mode=%s%s%s\n\n",
            o.device, o.num_chunks, o.chunk_bytes / 1024, o.concurrency, o.repeat,
            o.finegrained ? "fine-grained" : "coarse",
-           (unsigned long long)o.device_offset);
+           (unsigned long long)o.device_offset,
+           o.do_roundtrip ? "roundtrip," : "",
+           o.do_write_only ? "write," : "",
+           o.do_read_only ? "read," : "");
+
+    // Page-aligned buffers for the plain O_DIRECT pread()/pwrite() ground-truth
+    // checks (O_DIRECT requires aligned host buffers). `host` (below) does not
+    // need alignment -- it is only ever a hipMemcpy destination.
+    unsigned char *pread_buf = NULL, *pwrite_buf = NULL;
+    if (posix_memalign((void **)&pread_buf, page, o.chunk_bytes) != 0) {
+        perror("posix_memalign(pread_buf)");
+        return 1;
+    }
+    if (posix_memalign((void **)&pwrite_buf, page, o.chunk_bytes) != 0) {
+        perror("posix_memalign(pwrite_buf)");
+        return 1;
+    }
 
     unsigned char *host = malloc(o.chunk_bytes);
     if (!host) { perror("malloc"); return 1; }
 
-    long total_corrupt = 0;
+    long roundtrip_corrupt = 0, write_only_corrupt = 0, read_only_corrupt = 0;
+    long detail_printed = 0;
+    const long DETAIL_CAP = 16;
+
     for (int rep = 0; rep < o.repeat; rep++) {
-        // Distinct byte per (repeat, chunk) so stale slots are caught.
-        for (int c = 0; c < o.num_chunks; c++) {
-            int val = ((rep * 131 + c * 7) % 254) + 1;
-            HIP_CHECK(hipMemset((char *)src + (size_t)c * o.chunk_bytes, val,
-                                o.chunk_bytes));
-        }
-        HIP_CHECK(hipDeviceSynchronize());
+        if (o.do_roundtrip) {
+            // Distinct byte per (repeat, chunk) so stale slots are caught.
+            for (int c = 0; c < o.num_chunks; c++) {
+                int val = ((rep * 131 + c * 7) % 254) + 1;
+                HIP_CHECK(hipMemset((char *)src + (size_t)c * o.chunk_bytes, val,
+                                    o.chunk_bytes));
+            }
+            HIP_CHECK(hipDeviceSynchronize());
 
-        run_writes(&ring, nvme_fd, &o);
+            run_writes(&ring, nvme_fd, &o);
 
-        for (int c = 0; c < o.num_chunks; c++) {
-            read_slot(&ring, nvme_fd, o.device_offset + (uint64_t)c * o.chunk_bytes,
-                      o.chunk_bytes);
-            HIP_CHECK(hipMemcpy(host, dst, o.chunk_bytes, hipMemcpyDeviceToHost));
-            int want = ((rep * 131 + c * 7) % 254) + 1;
-            // Sample start / middle / end (corruption spans blocks, not 1 byte).
-            unsigned char a = host[0];
-            unsigned char b = host[o.chunk_bytes / 2];
-            unsigned char e = host[o.chunk_bytes - 1];
-            if (a != want || b != want || e != want) {
-                total_corrupt++;
-                if (total_corrupt <= 16)
-                    printf("  rep %d chunk %d: want 0x%02x got 0x%02x/0x%02x/0x%02x\n",
-                           rep, c, want, a, b, e);
+            for (int c = 0; c < o.num_chunks; c++) {
+                read_slot(&ring, nvme_fd,
+                         o.device_offset + (uint64_t)c * o.chunk_bytes,
+                         o.chunk_bytes);
+                HIP_CHECK(hipMemcpy(host, dst, o.chunk_bytes, hipMemcpyDeviceToHost));
+                int want = ((rep * 131 + c * 7) % 254) + 1;
+                // Sample start / middle / end (corruption spans blocks, not 1 byte).
+                unsigned char a = host[0];
+                unsigned char b = host[o.chunk_bytes / 2];
+                unsigned char e = host[o.chunk_bytes - 1];
+                if (a != want || b != want || e != want) {
+                    roundtrip_corrupt++;
+                    if (detail_printed++ < DETAIL_CAP)
+                        printf("  [roundtrip] rep %d chunk %d: want 0x%02x got "
+                               "0x%02x/0x%02x/0x%02x\n",
+                               rep, c, want, a, b, e);
+                }
             }
         }
+
+        if (o.do_write_only) {
+            for (int c = 0; c < o.num_chunks; c++) {
+                int val = ((rep * 131 + c * 7) % 254) + 1;
+                if (check_write_only(&ring, nvme_fd, src, c, o.chunk_bytes,
+                                     o.device_offset, pread_buf, val)) {
+                    write_only_corrupt++;
+                    if (detail_printed++ < DETAIL_CAP)
+                        printf("  [write-only] rep %d chunk %d: pread saw wrong "
+                               "bytes on disk (want 0x%02x)\n",
+                               rep, c, val);
+                }
+            }
+        }
+
+        if (o.do_read_only) {
+            for (int c = 0; c < o.num_chunks; c++) {
+                int val = ((rep * 131 + c * 7 + 3) % 254) + 1;  // distinct stream
+                if (check_read_only(&ring, nvme_fd, dst, o.chunk_bytes,
+                                    o.device_offset + (uint64_t)c * o.chunk_bytes,
+                                    pwrite_buf, host, val)) {
+                    read_only_corrupt++;
+                    if (detail_printed++ < DETAIL_CAP)
+                        printf("  [read-only] rep %d chunk %d: VRAM saw wrong "
+                               "bytes after READ_FIXED (want 0x%02x)\n",
+                               rep, c, val);
+                }
+            }
+        }
+
         // Per-repeat progress so a long, silent run does not look hung.
-        printf("rep %d/%d done: %ld corrupt so far\n", rep + 1, o.repeat,
-               total_corrupt);
+        printf("rep %d/%d done: roundtrip=%ld write-only=%ld read-only=%ld\n",
+               rep + 1, o.repeat, roundtrip_corrupt, write_only_corrupt,
+               read_only_corrupt);
         fflush(stdout);
     }
 
-    printf("\ncorrupt %ld / %d chunks (%d chunks x %d repeats)\n", total_corrupt,
-           o.num_chunks * o.repeat, o.num_chunks, o.repeat);
-    if (total_corrupt > 0)
-        printf("=> REPRODUCED: io_uring dma-buf WRITE_FIXED (NVMe peer-DMA reading "
-               "VRAM) corrupts.\n");
-    else
-        printf("=> clean this run (raise --repeat / --concurrency / --num-chunks).\n");
+    long n = (long)o.num_chunks * o.repeat;
+    printf("\n=== results (%d chunks x %d repeats = %ld checks per mode) ===\n",
+           o.num_chunks, o.repeat, n);
+    if (o.do_roundtrip)
+        printf("  roundtrip  corrupt: %5ld / %ld  (WRITE_FIXED then READ_FIXED; "
+               "does not isolate direction)\n",
+               roundtrip_corrupt, n);
+    if (o.do_write_only)
+        printf("  write-only corrupt: %5ld / %ld  (WRITE_FIXED verified via plain "
+               "pread -- isolates WRITE_FIXED)\n",
+               write_only_corrupt, n);
+    if (o.do_read_only)
+        printf("  read-only  corrupt: %5ld / %ld  (plain pwrite verified via "
+               "READ_FIXED -- isolates READ_FIXED)\n",
+               read_only_corrupt, n);
+
+    if (o.do_write_only && o.do_read_only) {
+        printf("\n=== interpretation ===\n");
+        if (write_only_corrupt > 0 && read_only_corrupt == 0)
+            printf("  WRITE_FIXED is broken (NVMe peer-DMA READING VRAM). "
+                   "READ_FIXED is clean.\n");
+        else if (write_only_corrupt == 0 && read_only_corrupt > 0)
+            printf("  READ_FIXED is broken (NVMe peer-DMA WRITING VRAM). "
+                   "WRITE_FIXED is clean.\n");
+        else if (write_only_corrupt > 0 && read_only_corrupt > 0)
+            printf("  BOTH directions are broken.\n");
+        else
+            printf("  Neither isolation check reproduced this run -- raise "
+                   "--repeat/--num-chunks, or rely on --mode roundtrip.\n");
+    }
 
     free(host);
+    free(pread_buf);
+    free(pwrite_buf);
     io_uring_queue_exit(&ring);
     close(nvme_fd);
     close(src_fd);

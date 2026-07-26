@@ -368,7 +368,8 @@ contract issue or something importer-side): ~35%, pending the matrix below.
 3. ~~Distinguish PRP from SGL.~~ *(Done; the user's `printk` confirmed PRP.)*
 4. Run isolated `READ_FIXED` with `--read-dest gpu` and
    `--read-dest udmabuf`, first without and then with
-   `--poison-before-read`.
+   `--poison-before-read`. **`--read-dest gpu` done, both with and without
+   poison (2026-07-26); `--read-dest udmabuf` still pending.**
 5. If GPU fails while `udmabuf` passes, investigate AMD's exporter and
    completion-to-GPU-visibility contract. If both fail, investigate the generic
    dma-buf token or nvme-pci importer path before involving amdgpu.
@@ -376,6 +377,43 @@ contract issue or something importer-side): ~35%, pending the matrix below.
    vary destination reuse. A future pattern upgrade should vary bytes within a
    chunk; the current full-buffer checker uses one distinct byte value per
    `(repeat, chunk)`.
+
+**GPU-destination results (2026-07-26):**
+
+```
+--read-dest gpu (no poison):
+  read-only : ok=0 mismatch=2560 short=0 error=0 eagain_exhausted=0
+              harness_error=0 (total=2560; isolates READ_FIXED)
+
+--read-dest gpu --poison-before-read:
+  read-only : ok=1 mismatch=2559 short=0 error=0 eagain_exhausted=0
+              harness_error=0 (total=2560; isolates READ_FIXED)
+  read mismatch diagnosis: unchanged_poison=2554 stale_previous=0
+                            partial_expected=5 mixed_or_other=0
+```
+
+**Decisive so far:** zero transport failures in either run — every `READ_FIXED`
+reports a full-length, error-free CQE. Without poisoning, 100% (2560/2560) of
+those "successful" reads deliver wrong content. With poisoning, **99.8% of the
+mismatches (2554/2559) are `unchanged_poison`**: the destination VRAM is
+*exactly* the pre-write sentinel byte across the full 2 MiB chunk (sample detail
+lines show `poison(0xa5)=2097152` — the entire buffer, not a partial region) —
+i.e. **the peer DMA write never became visible at the destination at all**,
+despite io_uring reporting success. `stale_previous=0` (not even one instance)
+rules out "the write is just delayed/cached" — if the write eventually landed on
+some lag, old data would leak through occasionally as it does; it never does
+here. `partial_expected=5/2560` is noise-level, ruling out a systematic
+misalignment/partial-transfer bug as the dominant mechanism.
+
+This sharpens (but does not yet close) the root cause: it is not generic
+"corruption" or a coherency race, it looks like **`READ_FIXED` completion is
+disconnected from whether the peer write actually reached the destination** —
+the kernel/token path signals success unconditionally rather than confirming
+the PCIe P2P write landed. The remaining open question is *where* that
+disconnect lives: the AMD exporter/GPU-visibility contract specifically, or the
+generic dma-buf-token/nvme-pci completion path regardless of exporter. The
+`--read-dest udmabuf` runs (same poison matrix, host memory instead of AMD VRAM,
+zero AMD/HIP participation) are what separates those two — pending.
 
 Poisoning here is a diagnostic sentinel, not fault injection. Before each
 `READ_FIXED`, the tool fills the destination with a byte value different from

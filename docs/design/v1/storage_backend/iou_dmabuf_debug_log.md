@@ -1,6 +1,6 @@
 # io_uring DMA-BUF Backend — Debugging Log & Root-Cause Record
 
-**Status:** blocked on a kernel/driver-level defect (not fixable in LMCache).
+**Status:** reproduces below LMCache; exporter/importer localization is in progress.
 **Audience:** engineers/agents picking this up, and kernel/amdgpu maintainers.
 **Companion repro:** `tools/repro_iou_dmabuf_p2p.c` (standalone C, no LMCache/Python).
 
@@ -22,12 +22,14 @@
 > of the investigation and tooling found the "amdgpu defect" attribution
 > **premature** and identified real tooling gaps. Summary (full detail in §5.1):
 >
-> - **Untested variable, still open:** every decisive run exported the dma-buf
->   with the default/unspecified mapping (`hipMemGetHandleForAddressRange(...,
->   flags=0)`). AMD exposes `hipMemRangeFlagDmaBufMappingTypePcie` (value `1`)
->   specifically for DMA-BUF PCIe P2P mappings, and it was never exercised. This
->   must be tested (`--mem-range-flags 1`) before the amdgpu attribution can be
->   trusted.
+> - **AMD export flags, resolved:** the attempted
+>   `hipMemGetHandleForAddressRange(..., flags=1)` call returns
+>   `hipErrorInvalidValue`. Inspection of the current HIP implementation confirms
+>   that it rejects every nonzero flag before exporting. ROCr's lower-level
+>   `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE` flag is not an alternate mapping mode: it
+>   checks Large BAR availability for a discrete, non-XGMI GPU and then calls the
+>   same KFD dma-buf export operation. The HIP tool must use `flags=0`; no valid
+>   HIP export option was omitted.
 > - **NVMe SGL vs. PRP, resolved:** the reviewer flagged that this kernel's top
 >   commit adds a new DMA-BUF SGL descriptor path (selected above a ~32 KiB
 >   average segment size, `drivers/nvme/host/pci.c`), which both LMCache and the
@@ -45,16 +47,16 @@
 > - **Confidence calibration (reviewer's estimate):** ~90% confident
 >   `READ_FIXED` genuinely fails under the tested configuration
 >   (`flags=0`, current kernel); only ~35% confident the defect is specifically
->   in amdgpu, pending the export-flag test and a `udmabuf` (non-GPU) control to
->   rule out the nvme-pci importer side. LMCache-side plumbing (allocator,
+>   in amdgpu, pending a `udmabuf` (non-GPU) control to rule out the nvme-pci
+>   importer side. LMCache-side plumbing (allocator,
 >   locking, callback semantics, teardown ordering, Rust fixed-buffer ABI) was
 >   independently assessed as sound, ~80% confidence, with the main residual
 >   risk being completion-to-GPU-visibility semantics rather than slot/index
 >   logic — consistent with §5's open question.
 >
-> **This document's "unsafe on this stack, file upstream" framing in §1 is
-> accurate for `READ_FIXED` as tested, but the exporter/kernel attribution is
-> not yet closed. Run the `--mem-range-flags 1` A/B (§5.1) before treating this
+> **This document's "unsafe on this stack" framing in §1 is accurate for
+> `READ_FIXED` as tested, but the exporter/kernel attribution is not yet closed.
+> Run the `udmabuf` and destination-poison controls in §5.1 before treating this
 > as an amdgpu bug report.**
 
 ---
@@ -108,16 +110,11 @@ explain this gap — something else about how the two tests exercise `READ_FIXED
 differs materially. Leading hypothesis and next experiment: §5.
 
 **Action:** the dmabuf `READ_FIXED` path (NVMe writing into AMD VRAM) is unsafe
-on this stack as tested (default/unspecified export mapping, `flags=0`);
-`WRITE_FIXED` is reliable. **Before filing upstream as an amdgpu bug**, close
-the two items in §5.1: (a) re-run `--mode read` with `--mem-range-flags 1`
-(`hipMemRangeFlagDmaBufMappingTypePcie`) — untested until now, and AMD's own
-documentation does not say the default mapping is valid for NVMe P2P; (b) run
-a `udmabuf` (host-memory, non-GPU) destination control through the same
-NVMe/kernel path to localize the defect to the amdgpu exporter vs. the
-nvme-pci importer. If flags=1 still corrupts and udmabuf is clean, the case
-against amdgpu becomes strong; if flags=1 fixes it, this was an export-mode
-usage gap, not a kernel/driver defect.
+on this stack as tested; `WRITE_FIXED` is reliable. HIP export flags are closed:
+nonzero values are invalid, and the lower-level ROCr PCIe flag does not select a
+different export mapping. Run the `udmabuf` destination control and destination
+poison matrix in §5.1 to distinguish a generic dma-buf-token/NVMe problem from
+an AMD exporter or GPU-visibility problem.
 
 ---
 
@@ -264,11 +261,11 @@ persistently.
 
 ### Not yet isolated (good next experiments)
 - **The rate-gap experiment above** (destination reuse / timing sensitivity).
-- **Exporter vs importer side:** does the same NVMe P2P *write-into-VRAM*
+- **GPU side vs. shared importer side:** does the same NVMe P2P read
   (`READ_FIXED`) corrupt with a `udmabuf` (host memory) destination instead of
-  amdgpu VRAM? If udmabuf is clean and amdgpu VRAM is not → squarely the amdgpu
-  exporter's P2P-write path. If udmabuf also corrupts → the nvme-pci
-  token/importer side.
+  amdgpu VRAM? If `udmabuf` is clean and amdgpu VRAM is not, the difference is
+  on the AMD export/GPU-visibility side. If `udmabuf` also corrupts, investigate
+  the shared dma-buf-token/nvme-pci importer side.
 - **NVIDIA control:** same workload with a CUDA-exported buffer, to see if the
   defect is AMD-specific.
 - **PCIe topology / `CONFIG_PCI_P2PDMA`:** confirm whether transfers are true P2P
@@ -287,18 +284,15 @@ substantive and change what can be claimed; the rest are tooling-quality issues
 that are now fixed (commit "iou-dmabuf tools: strict accounting, PCIe export
 flag, exception safety") or documentation cleanup.
 
-1. **(High, open) The amdgpu attribution is premature — the PCIe export mode was
-   never tested.** Every decisive run in §7.1–§7.3 exported with
-   `hipMemGetHandleForAddressRange(..., flags=0)` — the default/unspecified
-   mapping. AMD documents `hipMemRangeFlagDmaBufMappingTypePcie` (value `1`,
-   corresponding to the lower-level `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE`)
-   specifically for DMA-BUF mappings intended for peer-device (P2P) access, and
-   separately states that exported memory is not guaranteed fine-grain coherent
-   *even when allocated from a fine-grain pool* — meaning the §7.1 coarse-vs-fine
-   A/B, run entirely at `flags=0`, did not actually rule out mapping/coherency
-   behavior the way it was assumed to. **This is the single highest-priority
-   open item.** `tools/repro_iou_dmabuf_p2p.c` now supports
-   `--mem-range-flags 1` to test it directly.
+1. **(High, resolved) No HIP PCIe export flag was omitted.** The proposed
+   `--mem-range-flags 1` run fails with `hipErrorInvalidValue`. This is expected:
+   the current HIP implementation of `hipMemGetHandleForAddressRange` explicitly
+   rejects `flags != 0`. The similarly named ROCr v2 flag
+   `HSA_AMD_DMABUF_MAPPING_TYPE_PCIE` only rejects a discrete, non-XGMI GPU that
+   lacks Large BAR support; after that check, both flag values use the same
+   `hsaKmtExportDMABufHandle` operation. It does not request a different PCIe
+   mapping or cache-coherency mode. The C tool retains `--mem-range-flags` to
+   make old invocations fail clearly, but accepts only `0`.
 2. **(High, resolved by user-provided evidence) NVMe SGL vs. PRP was an
    unisolated second suspect.** This kernel's top feature commit adds a new
    DMA-BUF SGL descriptor path in `drivers/nvme/host/pci.c`, selected on
@@ -363,32 +357,42 @@ in the LMCache first-cut plumbing: ~80%, with the main residual risk being
 GPU-visible completion semantics (finding 5 above) rather than slot/index logic.
 Confidence that `READ_FIXED` genuinely fails under the tested
 `flags=0`/current-kernel configuration: ~90%. Confidence that this is
-*specifically* an amdgpu defect (as opposed to an export-flag usage gap, an
-NVMe/DMA-BUF synchronization contract issue, or something importer-side):
-~35%, pending the matrix below.
+*specifically* an amdgpu defect (as opposed to an NVMe/DMA-BUF synchronization
+contract issue or something importer-side): ~35%, pending the matrix below.
 
 **Decisive next matrix**, in priority order:
 
-1. Add `--mem-range-flags` and strict CQE accounting to the C reproducer. *(Done
-   — see the tooling-fix commit referenced above.)*
-2. Run `--mode read` with export flags `0` and `1`
-   (`hipMemRangeFlagDmaBufMappingTypePcie`) and compare.
-3. ~~Run both cases through PRP and SGL separately.~~ *(Done — user's `printk`
-   confirmed PRP; SGL is not implicated.)*
-4. Repeat fine-grained testing with the PCIe mapping flag and, where applicable,
-   `HSA_FORCE_FINE_GRAIN_PCIE=1`.
-5. Use a `udmabuf` destination as the control for the same NVMe/kernel path.
-6. Print raw pointer, aligned pointer, and exported range for each run, and
-   compare every byte using a non-repeating per-block pattern (the C repro
-   already does the latter — distinct value per `(repeat, chunk)` — but does not
-   yet print pointer/range diagnostics).
+1. ~~Add strict CQE accounting to the C reproducer.~~ *(Done.)*
+2. ~~Check the proposed nonzero HIP export flag.~~ *(Done; invalid by API and
+   rejected by the implementation.)*
+3. ~~Distinguish PRP from SGL.~~ *(Done; the user's `printk` confirmed PRP.)*
+4. Run isolated `READ_FIXED` with `--read-dest gpu` and
+   `--read-dest udmabuf`, first without and then with
+   `--poison-before-read`.
+5. If GPU fails while `udmabuf` passes, investigate AMD's exporter and
+   completion-to-GPU-visibility contract. If both fail, investigate the generic
+   dma-buf token or nvme-pci importer path before involving amdgpu.
+6. If the result remains timing-sensitive, print raw/aligned/exported ranges and
+   vary destination reuse. A future pattern upgrade should vary bytes within a
+   chunk; the current full-buffer checker uses one distinct byte value per
+   `(repeat, chunk)`.
 
-**If `flags=1` plus confirmed PRP still corrupts while `udmabuf` passes, the
-case against the amdgpu exporter/coherency path becomes strong enough to take
-upstream.** Right now, the investigation has convincingly cleared most of
-LMCache and ruled out NVMe SGL selection, but it has not yet uniquely convicted
-amdgpu — the export flag is the one variable standing between "READ_FIXED is
-broken here" and "READ_FIXED is broken because of amdgpu."
+Poisoning here is a diagnostic sentinel, not fault injection. Before each
+`READ_FIXED`, the tool fills the destination with a byte value different from
+both the expected disk byte and the previous read's byte. It then classifies
+every destination byte after a successful full-length CQE:
+
+- all poison: the peer write did not become visible at the destination;
+- all previous: stale contents remained;
+- expected plus poison/previous/other: only part of the destination changed;
+- neither expected, poison, nor previous: wrong-address or other corruption.
+
+The `udmabuf` case wraps CPU writes and reads in `DMA_BUF_IOCTL_SYNC`; the GPU
+case uses `hipMemset`/`hipDeviceSynchronize` and synchronous device-to-host
+`hipMemcpy`. Poisoning can itself perturb cache state or timing, so compare
+poisoned and unpoisoned runs. A poisoned run becoming clean is evidence that the
+extra synchronization or destination touch changes visibility, not proof that
+the underlying path is correct.
 
 ---
 
@@ -400,20 +404,29 @@ broken here" and "READ_FIXED is broken because of amdgpu."
 | `tools/probe_gpu_dmabuf_export.py` | Confirms a torch GPU pointer can be exported as a dmabuf fd (HIP or CUDA). The P1 go/no-go. |
 | `tools/probe_iou_dmabuf_e2e.py` | Single dmabuf `WRITE_FIXED`/`READ_FIXED` round-trip through the real `RawBlockDevice`, with a watchdog. |
 | `tools/diagnose_iou_dmabuf_coherency.py` | Raw-`RawBlockDevice` reproducer. Trials coarse vs fine-grained VRAM, and concurrent vs serialized writes. No `RawBlockCore`/backend. This is what isolated the bug below LMCache. |
-| `tools/repro_iou_dmabuf_p2p.c` | **Standalone C** repro (HIP + io_uring, no Python, no LMCache) — for kernel/driver maintainers. See §7. Supports `--mem-range-flags` (untested export mapping, §5.1 finding 1) and strict per-check accounting (six disjoint outcome buckets: ok/mismatch/short/error/eagain-exhausted/harness-error; nonzero exit on any failure). |
+| `tools/repro_iou_dmabuf_p2p.c` | **Standalone C** repro (HIP + io_uring, no Python, no LMCache) — for kernel/driver maintainers. See §7. Supports strict per-check accounting, an AMD VRAM vs. `udmabuf` read-destination control, and optional destination poisoning with full-byte classification. |
 
 ### How to reproduce the corruption
 
-Isolated, decisive, and fastest (see §7.3). Run with the default export mapping
-first, then with the PCIe mapping flag (§5.1 finding 1 — untested until now):
+Isolated, decisive, and fastest (see §7.3). Run this four-case matrix against a
+scratch range on the NVMe namespace:
 ```bash
 ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --device-offset $((4<<30))
-# expect read-only mismatch ~100% -- READ_FIXED (NVMe peer-DMA writing VRAM) is broken
 
-./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --device-offset $((4<<30)) \
-  --mem-range-flags 1
-# the decisive untested variable: does the PCIe P2P mapping type change the result?
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read \
+  --poison-before-read --device-offset $((4<<30))
+
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read \
+  --read-dest udmabuf --device-offset $((4<<30))
+
+./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read \
+  --read-dest udmabuf --poison-before-read --device-offset $((4<<30))
 ```
+
+Use the same `--num-chunks`, `--repeat`, `--chunk-bytes`, and device offset in
+all four runs. GPU failure with clean `udmabuf` results localizes the difference
+to AMD export/GPU visibility. Failure in both points to shared io_uring
+DMA-BUF-token or NVMe importer plumbing. See §5.1 for poison interpretation.
 
 Through the full LMCache backend (round-trip; undercounts the true rate, §7.3,
 but shows the defect is reachable end-to-end):
@@ -430,16 +443,19 @@ python benchmarks/storage_backend_io/iou_dmabuf_io_benchmark.py \
 
 `tools/repro_iou_dmabuf_p2p.c` removes every LMCache/Python/Rust layer. It:
 
-1. `hipMalloc` (or `hipExtMallocWithFlags` fine-grained) a GPU source pool and a
-   GPU dest buffer;
-2. exports each as a dmabuf fd via `hipMemGetHandleForAddressRange`;
+1. allocates and exports GPU source/destination buffers for the selected modes,
+   or creates a host-memory dma-buf through `/dev/udmabuf` for
+   `--mode read --read-dest udmabuf`;
+2. exports GPU allocations via `hipMemGetHandleForAddressRange(..., flags=0)`;
 3. opens the NVMe device `O_DIRECT`, sets up io_uring, registers a sparse buffer
    table and installs the dmabufs with `IORING_REGISTER_BUFFERS_UPDATE` +
    `IO_REGBUF_TYPE_DMABUF` bound to the NVMe fd;
 4. fills N source chunks with distinct patterns (`hipMemset` + `hipDeviceSynchronize`);
 5. issues N `WRITE_FIXED` (configurable in-flight depth, `-EAGAIN` reissue);
-6. reads each slot back with `READ_FIXED`, copies dest→host, verifies the pattern;
-7. repeats and reports the corruption count.
+6. reads each slot back with `READ_FIXED`, copies the destination to host, and
+   verifies every byte;
+7. optionally poisons the read destination before each operation and reports
+   whether mismatches contain expected, poison, previous, or other bytes.
 
 Build & run instructions are in the file header. Vary `--concurrency` (1 still
 corrupts), `--finegrained`, `--repeat`, `--device-offset` (avoid LBA 0 for a
@@ -579,7 +595,9 @@ much lower than the isolated `read-only` rate; see the open question in §5.
 
 - **`WRITE_FIXED` in these tools writes to the raw NVMe device** at the chosen
   offsets — destructive. Point them at a scratch namespace.
-- Reads (`READ_FIXED`) are non-destructive.
+- `READ_FIXED` itself does not modify storage, but `--mode read` first uses a
+  plain `pwrite()` to place ground-truth data on NVMe. Every mode in this tool
+  therefore writes to the selected raw-device range.
 - The C repro and `diagnose_iou_dmabuf_coherency.py` intentionally use device
   offset 0 by default for simplicity; pass a non-zero aligned `--device-offset`
   to avoid clobbering a partition table, and to sidestep the LBA-0 artifact noted
@@ -589,34 +607,23 @@ much lower than the isolated `read-only` rate; see the open question in §5.
 
 ## 9. One-paragraph handoff
 
-The LMCache io_uring DMA-BUF backend is functionally complete and correct on the
-software side (export, registration, slot lifecycle, write path all verified
-clean; independently reviewed at ~80% confidence, §5.1). It is **blocked by a
-`READ_FIXED` reliability defect, not yet uniquely attributed**: NVMe
-peer-to-peer DMA that *writes into* exported AMD VRAM (`READ_FIXED`) delivers
-stale bytes ~99.9% of the time when isolated and full-byte-verified (~90%
-confidence this is real under the tested config), while `WRITE_FIXED` (NVMe
-reading VRAM) is completely clean (0/2560 across a full run) — the **reverse**
-of what an earlier, round-trip-based analysis in this same document concluded
-(see the correction notice at the top). Concurrency plays no role: the
-isolation checks never have more than one operation in flight, and NVMe SGL
-selection has been ruled out via a user-added kernel `printk` confirming the
-PRP path is used. **What is not yet closed (~35% confidence it's specifically
-amdgpu): every decisive run exported the dma-buf with the default/unspecified
-mapping (`flags=0`) — the PCIe P2P mapping flag
-(`hipMemRangeFlagDmaBufMappingTypePcie=1`) has never been tested**, and AMD's
-own documentation does not guarantee fine-grain coherency for exported memory
-even at `flags=0` with a fine-grain pool. Reproduce with
-`./repro_iou_dmabuf_p2p --device /dev/nvmeXnY --mode read` (no LMCache; builds
-with plain `cc` against `libamdhip64`, no HIP dev headers needed; now with
-`--mem-range-flags` and strict per-check accounting, §5.1) — expect ~100%
-mismatch at `flags=0`. **Next step, in order:** (1) re-run with
-`--mem-range-flags 1` and compare; (2) if still broken, run a `udmabuf`
-(host-memory, non-GPU) destination as a control to localize the defect to the
-amdgpu exporter vs. the nvme-pci importer. Only once both are done should this
-be filed upstream as an amdgpu-specific bug report. A secondary open question
-(§5, not blocking the above) is why the full LMCache stack's own full-tensor
-integrity check shows only ~0.3–0.5% corruption versus the isolated ~99.9%
-rate, despite both being full-buffer comparisons — leading hypothesis is
-destination-buffer reuse pattern / completion-to-visibility timing, not yet
-tested.
+The LMCache io_uring DMA-BUF backend is functionally complete on the software
+side (export, registration, slot lifecycle, write path, and teardown reviewed at
+~80% confidence, §5.1). A standalone C program, with no LMCache/Python/Rust,
+isolates a `READ_FIXED` reliability failure: NVMe peer DMA writing into exported
+AMD VRAM produces mismatches in 2558/2560 full-buffer checks, while
+`WRITE_FIXED` is clean in 2560/2560 checks. Concurrency is not involved, and a
+kernel `printk` confirms the failing transfer uses PRP rather than SGL. The
+proposed HIP export flag `1` is not a remaining experiment: current HIP rejects
+all nonzero flags, and ROCr's similarly named lower-level flag performs only a
+Large-BAR eligibility check before using the same KFD export operation.
+Attribution is still open between the AMD export/GPU-visibility boundary and
+shared dma-buf-token/NVMe importer plumbing. Run the four GPU/`udmabuf`, with/
+without-poison cases in §6. A clean `udmabuf` result with a failing GPU result
+substantially narrows the issue to the AMD side; failure in both redirects the
+investigation to shared kernel/NVMe code. The poison byte classification further
+distinguishes an unchanged destination, stale prior data, and a partial write.
+The secondary open question is why the full LMCache integrity benchmark reports
+only ~0.3–0.5% mismatches versus ~99.9% in the isolated read test despite both
+checking full buffers; destination reuse and completion-to-visibility timing
+remain the leading variables.

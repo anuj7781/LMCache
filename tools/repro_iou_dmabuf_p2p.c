@@ -49,12 +49,24 @@
 // are different findings; conflating them would make "N corrupt" ambiguous
 // between "N times the bytes were wrong" and "N times something errored".
 //
-// --mem-range-flags F : passed as the final argument to
-// hipMemGetHandleForAddressRange for BOTH the source and dest exports (0 =
-// default/unspecified mapping; 1 = hipMemRangeHandleTypeDmaBufFd's PCIe mapping
-// type, hipMemRangeFlagDmaBufMappingTypePcie, intended for peer-device access).
-// All decisive runs recorded in the debug log before this option existed used
-// flags=0 -- the PCIe mapping mode was never exercised. Test both.
+// --read-dest gpu|udmabuf : select the destination for isolated `read` mode.
+// `gpu` (default) exercises AMD VRAM. `udmabuf` replaces only that destination
+// with mmap'ed host memory exported through /dev/udmabuf, keeping the same NVMe,
+// io_uring fixed-buffer registration, PRP/SGL selection, offsets, and checks.
+// A clean udmabuf run alongside a corrupt GPU run localizes the difference to
+// the AMD export/GPU-visibility side; corruption in both points lower toward
+// the generic dma-buf-token/NVMe importer path.
+//
+// --poison-before-read : fill the destination with a value distinct from the
+// expected and previous values before every READ_FIXED. On mismatch, the tool
+// counts expected, poison, previous, and other bytes. An unchanged poison buffer
+// means no peer-DMA write became visible at the destination; previous data means
+// a stale destination; a mix containing expected bytes means a partial update.
+//
+// --mem-range-flags F is retained for reproducibility, but AMD's current HIP
+// implementation rejects every nonzero value before export. ROCr's lower-level
+// PCIe flag is only a Large-BAR capability check and does not select a different
+// export path. Use 0 with this HIP-based tool.
 //
 // Output is a per-mode breakdown (all six buckets) plus an interpretation line
 // that maps directly to the three failure hypotheses, based on ok/mismatch
@@ -68,26 +80,24 @@
 // transport failure, so the tool is script/CI-usable.
 //
 // BUILD (host-only; no HIP dev headers or hipcc needed -- links libamdhip64):
-//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
-//      -L/opt/rocm/lib -lamdhip64
+//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring -L/opt/rocm/lib -lamdhip64
 //   # If -lamdhip64 is not found (runtime-only ROCm, no unversioned .so symlink),
 //   # link the versioned soname directly:
-//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring \
-//      "$(ls /opt/rocm*/lib/libamdhip64.so* 2>/dev/null | head -1)"
+//   cc -O2 -o repro_iou_dmabuf_p2p tools/repro_iou_dmabuf_p2p.c -luring "$(ls /opt/rocm*/lib/libamdhip64.so* 2>/dev/null | head -1)"
 //   # liburing dev headers: apt/dnf install liburing-dev (or point -I/-L at it).
 //   # ROCM_PATH may differ (e.g. /opt/rocm-6.x); adjust the lib path accordingly.
 //
 // RUN (WRITES ARE DESTRUCTIVE to the device at --device-offset; use scratch):
-//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --num-chunks 64 \
-//       --concurrency 8 --repeat 40 --device-offset $((4<<30))
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --num-chunks 64 --concurrency 8 --repeat 40 --device-offset $((4<<30))
 //   # narrow to one direction (faster, and the direct answer to "which leg?"):
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode write --device-offset $((4<<30))
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read  --device-offset $((4<<30))
+//   # generic dma-buf/NVMe control: no AMD allocation/export participates
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --read-dest udmabuf --poison-before-read --device-offset $((4<<30))
+//   # diagnose what remains in AMD VRAM when READ_FIXED reports completion
+//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --read-dest gpu --poison-before-read --device-offset $((4<<30))
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --concurrency 1   # roundtrip still corrupts
 //   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --finegrained     # fine-grained VRAM
-//   # test the untested variable: export with the PCIe P2P mapping flag
-//   ./repro_iou_dmabuf_p2p --device /dev/nvme0n1 --mode read --mem-range-flags 1 \
-//       --device-offset $((4<<30))
 //
 // Requires: a kernel with CONFIG_DMABUF_TOKEN and an NVMe device whose driver
 // implements the dma-buf token op (nvme-pci), and a ROCm version whose
@@ -101,11 +111,17 @@
 #define _GNU_SOURCE  // expose O_DIRECT from <fcntl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <liburing.h>
+#include <linux/dma-buf.h>
+#include <linux/memfd.h>
+#include <linux/udmabuf.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -204,6 +220,34 @@ struct mode_stats {
     long harness_error;
 };
 
+enum read_dest_kind {
+    READ_DEST_GPU = 0,
+    READ_DEST_UDMABUF,
+};
+
+struct udmabuf_memory {
+    void *ptr;
+    size_t size;
+    int memfd;
+    int dmabuf_fd;
+};
+
+struct mismatch_detail {
+    size_t expected;
+    size_t poison;
+    size_t previous;
+    size_t other;
+    size_t first_bad;
+    unsigned char first_got;
+};
+
+struct poison_stats {
+    long unchanged_poison;
+    long stale_previous;
+    long partial_expected;
+    long mixed_or_other;
+};
+
 static void stats_record(struct mode_stats *s, enum io_result r) {
     switch (r) {
         case IO_OK: s->ok++; break;
@@ -218,6 +262,61 @@ static void stats_record(struct mode_stats *s, enum io_result r) {
 static long stats_total(const struct mode_stats *s) {
     return s->ok + s->mismatch + s->io_short + s->io_error +
            s->io_eagain_exhausted + s->harness_error;
+}
+
+static const char *read_dest_name(enum read_dest_kind kind) {
+    return kind == READ_DEST_UDMABUF ? "udmabuf" : "gpu";
+}
+
+static unsigned char choose_poison(unsigned char expected, int have_previous,
+                                   unsigned char previous) {
+    static const unsigned char candidates[] = {0xa5, 0x5a, 0xcc, 0x33, 0x00, 0xff};
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (candidates[i] != expected &&
+            (!have_previous || candidates[i] != previous))
+            return candidates[i];
+    }
+    return (unsigned char)(expected + 1);
+}
+
+static void classify_bytes(const unsigned char *buf, size_t size,
+                           unsigned char expected, int poison_enabled,
+                           unsigned char poison, int have_previous,
+                           unsigned char previous, struct mismatch_detail *detail) {
+    memset(detail, 0, sizeof(*detail));
+    detail->first_bad = size;
+    for (size_t i = 0; i < size; i++) {
+        unsigned char got = buf[i];
+
+        if (got == expected) {
+            detail->expected++;
+        } else {
+            if (detail->first_bad == size) {
+                detail->first_bad = i;
+                detail->first_got = got;
+            }
+            if (poison_enabled && got == poison)
+                detail->poison++;
+            else if (have_previous && got == previous)
+                detail->previous++;
+            else
+                detail->other++;
+        }
+    }
+}
+
+static void poison_stats_record(struct poison_stats *stats,
+                                const struct mismatch_detail *detail,
+                                size_t size) {
+    if (detail->poison == size)
+        stats->unchanged_poison++;
+    else if (detail->previous == size)
+        stats->stale_previous++;
+    else if (detail->expected > 0)
+        stats->partial_expected++;
+    else
+        stats->mixed_or_other++;
 }
 
 #define HIP_CHECK(call)                                                       \
@@ -238,10 +337,8 @@ static int io_uring_register_raw(int ring_fd, unsigned opcode, void *arg,
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
-// Export [ptr, ptr+size) as a dma-buf fd. `mem_range_flags` is passed through
-// unchanged to hipMemGetHandleForAddressRange -- 0 for the default/unspecified
-// mapping, 1 for hipMemRangeFlagDmaBufMappingTypePcie (the PCIe P2P mapping
-// mode). All decisive runs recorded before --mem-range-flags existed used 0.
+// Export [ptr, ptr+size) as a dma-buf fd. Current HIP implementations accept
+// only mem_range_flags=0; main rejects nonzero values before reaching this call.
 static int export_dmabuf(void *ptr, size_t size, unsigned long long mem_range_flags) {
     int fd = -1;
     hipError_t e = hipMemGetHandleForAddressRange(
@@ -276,6 +373,127 @@ static void *gpu_alloc_aligned(size_t size, int finegrained, long page,
     return (void *)base;
 }
 
+static int create_udmabuf(struct udmabuf_memory *memory, size_t size) {
+    struct udmabuf_create create = {0};
+    int devfd = -1;
+
+    memory->ptr = MAP_FAILED;
+    memory->size = size;
+    memory->memfd = -1;
+    memory->dmabuf_fd = -1;
+
+    devfd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (devfd < 0) {
+        fprintf(stderr, "open(/dev/udmabuf): %s "
+                        "(CONFIG_UDMABUF and the device node are required)\n",
+                strerror(errno));
+        goto error;
+    }
+
+    memory->memfd = memfd_create("iou-dmabuf-read-dest",
+                                 MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (memory->memfd < 0) {
+        fprintf(stderr, "memfd_create: %s\n", strerror(errno));
+        goto error;
+    }
+    if (fcntl(memory->memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) {
+        fprintf(stderr, "F_ADD_SEALS(F_SEAL_SHRINK): %s\n", strerror(errno));
+        goto error;
+    }
+    if (ftruncate(memory->memfd, (off_t)size) < 0) {
+        fprintf(stderr, "ftruncate(udmabuf memfd): %s\n", strerror(errno));
+        goto error;
+    }
+
+    create.memfd = (uint32_t)memory->memfd;
+    create.flags = UDMABUF_FLAGS_CLOEXEC;
+    create.offset = 0;
+    create.size = size;
+    memory->dmabuf_fd = ioctl(devfd, UDMABUF_CREATE, &create);
+    if (memory->dmabuf_fd < 0) {
+        fprintf(stderr, "UDMABUF_CREATE: %s\n", strerror(errno));
+        goto error;
+    }
+    memory->ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       memory->dmabuf_fd, 0);
+    if (memory->ptr == MAP_FAILED) {
+        fprintf(stderr, "mmap(udmabuf): %s\n", strerror(errno));
+        goto error;
+    }
+
+    close(devfd);
+    return 0;
+
+error:
+    if (devfd >= 0)
+        close(devfd);
+    if (memory->ptr != MAP_FAILED)
+        munmap(memory->ptr, memory->size);
+    if (memory->dmabuf_fd >= 0)
+        close(memory->dmabuf_fd);
+    if (memory->memfd >= 0)
+        close(memory->memfd);
+    memory->ptr = MAP_FAILED;
+    memory->dmabuf_fd = -1;
+    memory->memfd = -1;
+    return -1;
+}
+
+static void close_udmabuf(struct udmabuf_memory *memory) {
+    if (memory->ptr != MAP_FAILED)
+        munmap(memory->ptr, memory->size);
+    if (memory->dmabuf_fd >= 0)
+        close(memory->dmabuf_fd);
+    if (memory->memfd >= 0)
+        close(memory->memfd);
+}
+
+static int dmabuf_cpu_sync(int dmabuf_fd, uint64_t flags, const char *operation) {
+    struct dma_buf_sync sync = {.flags = flags};
+
+    if (ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+        fprintf(stderr, "DMA_BUF_IOCTL_SYNC(%s): %s\n", operation,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int poison_destination(enum read_dest_kind kind, void *dst, int dst_fd,
+                              size_t size, unsigned char poison) {
+    if (kind == READ_DEST_GPU) {
+        HIP_CHECK(hipMemset(dst, poison, size));
+        HIP_CHECK(hipDeviceSynchronize());
+        return 0;
+    }
+
+    if (dmabuf_cpu_sync(dst_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
+                        "START|WRITE") < 0)
+        return -1;
+    memset(dst, poison, size);
+    if (dmabuf_cpu_sync(dst_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE,
+                        "END|WRITE") < 0)
+        return -1;
+    return 0;
+}
+
+static int copy_destination_to_host(enum read_dest_kind kind, void *dst, int dst_fd,
+                                    unsigned char *host, size_t size) {
+    if (kind == READ_DEST_GPU) {
+        HIP_CHECK(hipMemcpy(host, dst, size, hipMemcpyDeviceToHost));
+        return 0;
+    }
+
+    if (dmabuf_cpu_sync(dst_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+                        "START|READ") < 0)
+        return -1;
+    memcpy(host, dst, size);
+    if (dmabuf_cpu_sync(dst_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+                        "END|READ") < 0)
+        return -1;
+    return 0;
+}
+
 struct opts {
     const char *device;
     int num_chunks;
@@ -289,6 +507,8 @@ struct opts {
     int do_write_only;
     int do_read_only;
     unsigned long long mem_range_flags;
+    enum read_dest_kind read_dest;
+    int poison_before_read;
 };
 
 // Submit N WRITE_FIXED (src chunk c -> device slot c), <= concurrency in flight,
@@ -474,10 +694,19 @@ static enum io_result check_write_only(struct io_uring *ring, int nvme_fd,
 // io_result / the file header): a transport failure or ground-truth pwrite()
 // failure is never reported as IO_MISMATCH.
 static enum io_result check_read_only(struct io_uring *ring, int nvme_fd,
-                                      void *dst, size_t chunk,
+                                      enum read_dest_kind dest_kind, void *dst,
+                                      int dst_fd, size_t chunk,
                                       uint64_t device_offset,
                                       unsigned char *pwrite_buf,
-                                      unsigned char *host, int val) {
+                                      unsigned char *host, int val,
+                                      int poison_before_read, int have_previous,
+                                      int previous_val,
+                                      struct mismatch_detail *detail) {
+    unsigned char expected = (unsigned char)val;
+    unsigned char previous = (unsigned char)previous_val;
+    unsigned char poison =
+        choose_poison(expected, have_previous, previous);
+
     memset(pwrite_buf, (unsigned char)val, chunk);
     ssize_t n = pwrite(nvme_fd, pwrite_buf, chunk, device_offset);
     if (n != (ssize_t)chunk) {
@@ -486,12 +715,18 @@ static enum io_result check_read_only(struct io_uring *ring, int nvme_fd,
                 n < 0 ? strerror(errno) : "short write");
         return IO_HARNESS_ERROR;
     }
+    if (poison_before_read &&
+        poison_destination(dest_kind, dst, dst_fd, chunk, poison) < 0)
+        return IO_HARNESS_ERROR;
+
     enum io_result rd = read_slot(ring, nvme_fd, device_offset, chunk);
     if (rd != IO_OK) return rd;
-    HIP_CHECK(hipMemcpy(host, dst, chunk, hipMemcpyDeviceToHost));
-    for (size_t i = 0; i < chunk; i++)
-        if (host[i] != (unsigned char)val) return IO_MISMATCH;
-    return IO_OK;
+    if (copy_destination_to_host(dest_kind, dst, dst_fd, host, chunk) < 0)
+        return IO_HARNESS_ERROR;
+
+    classify_bytes(host, chunk, expected, poison_before_read, poison,
+                   have_previous, previous, detail);
+    return detail->expected == chunk ? IO_OK : IO_MISMATCH;
 }
 
 int main(int argc, char **argv) {
@@ -508,6 +743,8 @@ int main(int argc, char **argv) {
         .do_write_only = 1,
         .do_read_only = 1,
         .mem_range_flags = 0,
+        .read_dest = READ_DEST_GPU,
+        .poison_before_read = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc)
@@ -528,7 +765,19 @@ int main(int argc, char **argv) {
             o.finegrained = 1;
         else if (!strcmp(argv[i], "--device-index") && i + 1 < argc)
             o.device_index = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
+        else if (!strcmp(argv[i], "--read-dest") && i + 1 < argc) {
+            const char *dest = argv[++i];
+            if (!strcmp(dest, "gpu"))
+                o.read_dest = READ_DEST_GPU;
+            else if (!strcmp(dest, "udmabuf"))
+                o.read_dest = READ_DEST_UDMABUF;
+            else {
+                fprintf(stderr, "--read-dest must be one of: gpu, udmabuf\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--poison-before-read")) {
+            o.poison_before_read = 1;
+        } else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
             o.do_roundtrip = o.do_write_only = o.do_read_only = 0;
             if (!strcmp(m, "all"))
@@ -553,22 +802,77 @@ int main(int argc, char **argv) {
         return 2;
     }
     long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        fprintf(stderr, "sysconf(_SC_PAGESIZE) failed\n");
+        return 2;
+    }
+    if (o.num_chunks <= 0 || o.repeat <= 0 || o.chunk_bytes == 0) {
+        fprintf(stderr,
+                "--num-chunks, --repeat, and --chunk-bytes must be positive\n");
+        return 2;
+    }
+    if (o.chunk_bytes > UINT_MAX ||
+        (size_t)o.num_chunks > SIZE_MAX / o.chunk_bytes) {
+        fprintf(stderr, "requested transfer or allocation size is too large\n");
+        return 2;
+    }
     if (o.chunk_bytes % page || o.device_offset % page) {
         fprintf(stderr, "--chunk-bytes and --device-offset must be multiples of %ld\n",
                 page);
         return 2;
     }
     if (o.concurrency < 1) o.concurrency = 1;
+    if (o.mem_range_flags != 0) {
+        fprintf(stderr,
+                "--mem-range-flags must be 0: AMD HIP currently rejects all "
+                "nonzero values, and ROCr's PCIe flag does not select a "
+                "different export path\n");
+        return 2;
+    }
+    if (o.read_dest == READ_DEST_UDMABUF &&
+        (!o.do_read_only || o.do_roundtrip || o.do_write_only)) {
+        fprintf(stderr,
+                "--read-dest udmabuf requires --mode read so the control changes "
+                "only the READ_FIXED destination\n");
+        return 2;
+    }
+    if (o.poison_before_read &&
+        (!o.do_read_only || o.do_roundtrip || o.do_write_only)) {
+        fprintf(stderr,
+                "--poison-before-read requires --mode read; poisoning is a "
+                "diagnostic for the isolated READ_FIXED path\n");
+        return 2;
+    }
 
-    HIP_CHECK(hipSetDevice(o.device_index));
-
-    // Allocate + export source pool (N chunks) and a 1-chunk dest buffer.
+    // Allocate only the buffers used by the selected mode. In the udmabuf
+    // read-only control no HIP allocation or AMD export participates at all.
     void *src_raw = NULL, *dst_raw = NULL;
+    void *src = NULL, *dst = NULL;
+    int src_fd = -1, dst_fd = -1;
+    struct udmabuf_memory udmabuf = {
+        .ptr = MAP_FAILED,
+        .size = 0,
+        .memfd = -1,
+        .dmabuf_fd = -1,
+    };
     size_t pool = (size_t)o.num_chunks * o.chunk_bytes;
-    void *src = gpu_alloc_aligned(pool, o.finegrained, page, &src_raw);
-    void *dst = gpu_alloc_aligned(o.chunk_bytes, o.finegrained, page, &dst_raw);
-    int src_fd = export_dmabuf(src, pool, o.mem_range_flags);
-    int dst_fd = export_dmabuf(dst, o.chunk_bytes, o.mem_range_flags);
+    int need_gpu = o.do_roundtrip || o.do_write_only ||
+                   o.read_dest == READ_DEST_GPU;
+    if (need_gpu)
+        HIP_CHECK(hipSetDevice(o.device_index));
+    if (o.do_roundtrip || o.do_write_only) {
+        src = gpu_alloc_aligned(pool, o.finegrained, page, &src_raw);
+        src_fd = export_dmabuf(src, pool, o.mem_range_flags);
+    }
+    if (o.read_dest == READ_DEST_GPU) {
+        dst = gpu_alloc_aligned(o.chunk_bytes, o.finegrained, page, &dst_raw);
+        dst_fd = export_dmabuf(dst, o.chunk_bytes, o.mem_range_flags);
+    } else {
+        if (create_udmabuf(&udmabuf, o.chunk_bytes) < 0)
+            return 1;
+        dst = udmabuf.ptr;
+        dst_fd = udmabuf.dmabuf_fd;
+    }
 
     int nvme_fd = open(o.device, O_RDWR | O_DIRECT);
     if (nvme_fd < 0) {
@@ -578,14 +882,14 @@ int main(int argc, char **argv) {
 
     struct io_uring ring;
     unsigned depth = 256;
-    int r = io_uring_queue_init(depth, &ring, 0);
-    if (r < 0) {
-        fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-r));
+    int ring_ret = io_uring_queue_init(depth, &ring, 0);
+    if (ring_ret < 0) {
+        fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ring_ret));
         return 1;
     }
 
-    // Sparse buffer table with 2 slots, then install the two dma-bufs bound to
-    // the NVMe fd.
+    // Sparse table keeps stable slot numbers even when read-only mode does not
+    // need a source buffer. Install each active dma-buf bound to the NVMe fd.
     struct repro_rsrc_register reg = {0};
     reg.nr = 2;
     reg.flags = IORING_RSRC_REGISTER_SPARSE;
@@ -596,6 +900,8 @@ int main(int argc, char **argv) {
     }
     int fds[2] = {src_fd, dst_fd};
     for (int slot = 0; slot < 2; slot++) {
+        if (fds[slot] < 0)
+            continue;
         struct repro_regbuf_desc desc = {0};
         desc.type = REPRO_REGBUF_TYPE_DMABUF;
         desc.dmabuf_fd = fds[slot];
@@ -618,9 +924,11 @@ int main(int argc, char **argv) {
     }
 
     printf("device=%s chunks=%d chunk=%zuKiB concurrency=%d repeat=%d "
-           "mem=%s dev_off=%llu mem_range_flags=%llu mode=%s%s%s\n\n",
+           "mem=%s read_dest=%s poison=%s dev_off=%llu "
+           "mem_range_flags=%llu mode=%s%s%s\n\n",
            o.device, o.num_chunks, o.chunk_bytes / 1024, o.concurrency, o.repeat,
-           o.finegrained ? "fine-grained" : "coarse",
+           need_gpu ? (o.finegrained ? "fine-grained" : "coarse") : "n/a",
+           read_dest_name(o.read_dest), o.poison_before_read ? "on" : "off",
            (unsigned long long)o.device_offset, o.mem_range_flags,
            o.do_roundtrip ? "roundtrip," : "",
            o.do_write_only ? "write," : "",
@@ -628,7 +936,7 @@ int main(int argc, char **argv) {
 
     // Page-aligned buffers for the plain O_DIRECT pread()/pwrite() ground-truth
     // checks (O_DIRECT requires aligned host buffers). `host` (below) does not
-    // need alignment -- it is only ever a hipMemcpy destination.
+    // need alignment; it receives either a hipMemcpy or a udmabuf mmap copy.
     unsigned char *pread_buf = NULL, *pwrite_buf = NULL;
     if (posix_memalign((void **)&pread_buf, page, o.chunk_bytes) != 0) {
         perror("posix_memalign(pread_buf)");
@@ -643,6 +951,7 @@ int main(int argc, char **argv) {
     if (!host) { perror("malloc"); return 1; }
 
     struct mode_stats roundtrip_stats = {0}, write_stats = {0}, read_stats = {0};
+    struct poison_stats read_mismatch_stats = {0};
     long detail_printed = 0;
     const long DETAIL_CAP = 16;
 
@@ -724,20 +1033,68 @@ int main(int argc, char **argv) {
         if (o.do_read_only) {
             for (int c = 0; c < o.num_chunks; c++) {
                 int val = ((rep * 131 + c * 7 + 3) % 254) + 1;  // distinct stream
+                int have_previous = rep > 0 || c > 0;
+                int previous_val = 0;
+                if (c > 0)
+                    previous_val =
+                        ((rep * 131 + (c - 1) * 7 + 3) % 254) + 1;
+                else if (rep > 0)
+                    previous_val =
+                        (((rep - 1) * 131 + (o.num_chunks - 1) * 7 + 3) %
+                         254) +
+                        1;
+                struct mismatch_detail detail;
                 enum io_result r = check_read_only(
-                    &ring, nvme_fd, dst, o.chunk_bytes,
+                    &ring, nvme_fd, o.read_dest, dst, dst_fd, o.chunk_bytes,
                     o.device_offset + (uint64_t)c * o.chunk_bytes, pwrite_buf, host,
-                    val);
+                    val, o.poison_before_read, have_previous, previous_val,
+                    &detail);
                 stats_record(&read_stats, r);
-                if (r != IO_OK && detail_printed++ < DETAIL_CAP)
+                if (r == IO_MISMATCH) {
+                    poison_stats_record(&read_mismatch_stats, &detail,
+                                        o.chunk_bytes);
+                    if (detail_printed++ < DETAIL_CAP) {
+                        char previous_label[8];
+                        unsigned char poison = choose_poison(
+                            (unsigned char)val, have_previous,
+                            (unsigned char)previous_val);
+
+                        if (have_previous)
+                            snprintf(previous_label, sizeof(previous_label),
+                                     "0x%02x", previous_val);
+                        else
+                            snprintf(previous_label, sizeof(previous_label),
+                                     "n/a");
+                        if (o.poison_before_read)
+                            printf("  [read-only] rep %d chunk %d: mismatch "
+                                   "want=0x%02x expected=%zu "
+                                   "poison(0x%02x)=%zu "
+                                   "previous(%s)=%zu other=%zu "
+                                   "first_bad=%zu got=0x%02x\n",
+                                   rep, c, val, detail.expected, poison,
+                                   detail.poison, previous_label,
+                                   detail.previous,
+                                   detail.other, detail.first_bad,
+                                   detail.first_got);
+                        else
+                            printf("  [read-only] rep %d chunk %d: mismatch "
+                                   "want=0x%02x expected=%zu "
+                                   "previous(%s)=%zu other=%zu "
+                                   "first_bad=%zu got=0x%02x\n",
+                                   rep, c, val, detail.expected,
+                                   previous_label, detail.previous, detail.other,
+                                   detail.first_bad, detail.first_got);
+                    }
+                } else if (r != IO_OK && detail_printed++ < DETAIL_CAP) {
                     printf("  [read-only] rep %d chunk %d: %s (want 0x%02x)\n",
                            rep, c,
-                           r == IO_MISMATCH ? "VRAM saw wrong bytes after READ_FIXED"
-                           : r == IO_SHORT ? "READ_FIXED was short"
+                           r == IO_SHORT ? "READ_FIXED was short"
                            : r == IO_ERROR ? "READ_FIXED errored"
-                           : r == IO_EAGAIN_EXHAUSTED ? "READ_FIXED EAGAIN-exhausted"
-                                                       : "pwrite ground-truth failed",
+                           : r == IO_EAGAIN_EXHAUSTED
+                               ? "READ_FIXED EAGAIN-exhausted"
+                               : "read harness failed",
                            val);
+                }
             }
         }
 
@@ -775,6 +1132,23 @@ int main(int argc, char **argv) {
                read_stats.ok, read_stats.mismatch, read_stats.io_short,
                read_stats.io_error, read_stats.io_eagain_exhausted,
                read_stats.harness_error, stats_total(&read_stats));
+    if (o.do_read_only && read_stats.mismatch) {
+        if (o.poison_before_read)
+            printf("  read mismatch diagnosis: unchanged_poison=%ld "
+                   "stale_previous=%ld partial_expected=%ld "
+                   "mixed_or_other=%ld\n",
+                   read_mismatch_stats.unchanged_poison,
+                   read_mismatch_stats.stale_previous,
+                   read_mismatch_stats.partial_expected,
+                   read_mismatch_stats.mixed_or_other);
+        else
+            printf("  read mismatch diagnosis (poison disabled): "
+                   "stale_previous=%ld partial_expected=%ld "
+                   "mixed_or_other=%ld\n",
+                   read_mismatch_stats.stale_previous,
+                   read_mismatch_stats.partial_expected,
+                   read_mismatch_stats.mixed_or_other);
+    }
 
     int exit_status = 0;
     if (o.do_write_only && o.do_read_only) {
@@ -807,9 +1181,15 @@ int main(int argc, char **argv) {
     free(pwrite_buf);
     io_uring_queue_exit(&ring);
     close(nvme_fd);
-    close(src_fd);
-    close(dst_fd);
-    hipFree(src_raw);
-    hipFree(dst_raw);
+    if (src_fd >= 0)
+        close(src_fd);
+    if (o.read_dest == READ_DEST_UDMABUF)
+        close_udmabuf(&udmabuf);
+    else if (dst_fd >= 0)
+        close(dst_fd);
+    if (src_raw != NULL)
+        HIP_CHECK(hipFree(src_raw));
+    if (dst_raw != NULL)
+        HIP_CHECK(hipFree(dst_raw));
     return exit_status;
 }

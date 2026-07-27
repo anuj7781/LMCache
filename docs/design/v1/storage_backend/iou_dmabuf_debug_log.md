@@ -801,21 +801,35 @@ into the single top-of-file summary, and the EAGAIN retry loop dropped from
 retry loop matters for `repro_iou_dmabuf_p2p.c`'s longer stress runs, not
 here).
 
-It also reverted the self-contained-ABI trick used by `repro_iou_dmabuf_p2p.c`
-and `repro_iou_dmabuf_minimal.c` (redeclaring `repro_`-prefixed copies of the
-dma-buf registration structs and calling them via the raw
-`io_uring_register(2)` syscall to build against any stock `liburing-dev`).
-That trick existed only for *our* convenience compiling on boxes without the
-patched liburing checked out — the maintainers this file is going to are the
-ones who *have* the patched kernel/liburing (they're implementing this
-feature), so using the real `<liburing.h>` types
-(`io_uring_regbuf_desc`/`IO_REGBUF_TYPE_DMABUF`/etc.) directly is both
-simpler and safer: it can't silently drift from the real ABI the way a
-hand-copied struct could if the interface changes during review. Consequence:
-this file now needs a **patched** liburing to compile, unlike §7.1–§7.4's
-tools. Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum
--Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against the patched
-liburing header tree.
+**Reverted a reversal:** an intermediate version of this file switched to
+using `<liburing.h>`'s real `io_uring_regbuf_desc`/`IO_REGBUF_TYPE_DMABUF`
+directly, reasoning that maintainers implementing this feature would already
+have the patched liburing checked out. Wrong assumption — the intended
+audience is broader than the people actively writing the patch (NVMe/AMD
+folks reviewing or triaging it may have nothing but a stock liburing, or
+nothing at all installed), and requiring the exact in-review branch
+(`isilence/liburing.git` @ `rw-dmabuf-tests-v3`, as of this writing — several
+*other* branches on that same remote, e.g. `dmabuf-rw`/`regbuf-import`/
+`regbuf-import2`/`zcrx-dmabuf`, are earlier iterations with incompatible
+struct layouts) would block them from building it at all.
+
+Checked what's actually new here versus what's been in liburing for years:
+`struct io_uring_rsrc_update2`, `IORING_REGISTER_BUFFERS_UPDATE`,
+`io_uring_register()`, and `io_uring_register_buffers_sparse()` all predate
+this patch series by several years (confirmed present in the pre-dma-buf-patch
+liburing snapshot used earlier in this doc) — only `io_uring_regbuf_desc`,
+`IO_REGBUF_TYPE_DMABUF`, and `IORING_RSRC_UPDATE_EXTENDED` are genuinely new
+and unmerged. So the fix isn't "redeclare the whole ABI" (§7.1/§7.4's
+approach) — it's "redeclare just that one struct and its two constants,
+under different names so they can't collide with whatever the reader's
+liburing does or doesn't already define, and use real liburing calls for
+everything else." Net result: `repro_iou_dmabuf_basic.c` now builds against
+*any* liburing new enough to have fixed-buffer registration support (years
+old, essentially universal) — not just the specific in-review branch.
+Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum -Wformat=2`) and
+`gcc -fanalyzer`, both zero warnings, against both a genuinely stock
+(pre-dma-buf-patch) liburing header tree and the patched
+`rw-dmabuf-tests-v3` tree.
 
 Expected output on this hardware:
 ```

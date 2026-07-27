@@ -21,6 +21,15 @@
 // passes, READ_FIXED fails (the destination is left unchanged), for the
 // GPU VRAM buffer only -- udmabuf passes both.
 //
+// This registers the dma-buf via the DMA-BUF buffer-registration extension
+// to io_uring (struct io_uring_regbuf_desc / IO_REGBUF_TYPE_DMABUF), which
+// is not yet merged upstream, so it is unlikely to be in whatever liburing
+// you have installed. The struct and its two constants are defined locally
+// below (under different names, to avoid clashing with any liburing that
+// does have them). Everything else this program uses is ordinary, long
+// since released liburing/HIP API -- an ordinary liburing install is all
+// that's otherwise needed.
+//
 // WARNING: overwrites 2 MiB at the given device offset.
 //
 // Build:
@@ -68,6 +77,23 @@ extern hipError_t hipMemGetHandleForAddressRange(void *handle,
                                                  size_t size, int type,
                                                  unsigned long long flags);
 extern const char *hipGetErrorString(hipError_t error);
+
+// Not-yet-upstream: the new registration type used to bind a dma-buf fd to
+// an io_uring instance. type = DMABUF_REGBUF_TYPE selects the dma-buf-fd
+// variant of the union that this struct otherwise represents; size and
+// uaddr must be left 0 for that variant.
+#define DMABUF_REGBUF_TYPE 2
+#define DMABUF_RSRC_UPDATE_EXTENDED (1u << 1)
+
+struct dmabuf_regbuf_desc {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t size;
+    uint64_t uaddr;
+    int32_t dmabuf_fd;
+    int32_t target_fd;
+    uint64_t __resv[6];
+};
 
 // One buffer under test: either a udmabuf (host memfd-backed) or an AMD GPU
 // VRAM allocation. Exactly one of {memfd, gpu_ptr} is meaningful per kind.
@@ -208,13 +234,13 @@ static void load_pattern(struct exporter *exp, unsigned char *out)
 
 static int register_buffer(struct io_uring *ring, int nvme_fd, int dmabuf_fd)
 {
-    struct io_uring_regbuf_desc desc = {
-        .type = IO_REGBUF_TYPE_DMABUF,
+    struct dmabuf_regbuf_desc desc = {
+        .type = DMABUF_REGBUF_TYPE,
         .dmabuf_fd = dmabuf_fd,
         .target_fd = nvme_fd,
     };
     struct io_uring_rsrc_update2 update = {
-        .resv = IORING_RSRC_UPDATE_EXTENDED,
+        .resv = DMABUF_RSRC_UPDATE_EXTENDED,
         .data = (uint64_t)(uintptr_t)&desc,
         .nr = 1,
     };

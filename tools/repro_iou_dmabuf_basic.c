@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Stage-1 minimal io_uring DMA-BUF round-trip test.
+// Stage-1 minimal io_uring DMA-BUF test.
 //
-// The simplest thing that could possibly show the bug: for each exporter
-// (udmabuf, then AMD VRAM), fill a buffer with a known byte pattern,
-// WRITE_FIXED it to NVMe, zero the buffer, READ_FIXED it back from NVMe,
-// and compare. No poisoning classification, no independent ground-truth
-// pread/pwrite side-channel, no DMA_BUF_SYNC -- see
+// For each exporter (udmabuf, then AMD VRAM), runs 4 operations and verifies
+// each one independently against its own ground truth:
+//
+//   1. STORE:       fill the exporter's backing store with a known pattern,
+//                   then read it straight back through the exporter itself
+//                   (no io_uring) to confirm the exporter's own set/get path
+//                   works before layering io_uring on top of it.
+//   2. WRITE_FIXED:  buffer -> NVMe, checked with a plain pread() ground
+//                    truth on the device. Bypasses READ_FIXED entirely, so
+//                    this result does not depend on phase 3.
+//   3. READ_FIXED:   NVMe -> buffer, seeded by a plain pwrite() ground truth
+//                    on the device (independent of phase 2's WRITE_FIXED)
+//                    and preceded by zeroing the buffer, so a no-op
+//                    READ_FIXED can't hide behind phase 1's leftover data.
+//
+// Each phase prints its own PASS/FAIL/ERROR, so a run tells you not just
+// THAT something is broken but WHICH of the 4 operations is broken --
+// without stage 2's byte-level poison classification (plain memcmp here,
+// not expected/poison/other counts) and without DMA_BUF_SYNC. See
 // docs/design/v1/storage_backend/iou_dmabuf_debug_log.md ("basic" vs
-// "minimal" reproducer) for why those aren't needed here. For a test that
-// tells you WHICH direction (write vs read) is broken, use
-// repro_iou_dmabuf_minimal.c instead -- this one only tells you THAT the
-// round trip is broken.
-//
-// The zero-out between WRITE_FIXED and READ_FIXED is not optional: without
-// it, a READ_FIXED that silently does nothing would leave the buffer's
-// original (correct) contents in place and this test would falsely PASS.
+// "minimal" reproducer) for why those two are unneeded here.
 //
 // Like repro_iou_dmabuf_p2p.c and repro_iou_dmabuf_minimal.c, this redeclares
 // its own minimal copy of the dma-buf registration ABI and calls it via the
@@ -153,6 +160,20 @@ static void require_full(ssize_t ret, const char *what)
     exit(2);
 }
 
+// Page-aligned: these buffers are used for direct pread()/pwrite() ground
+// truth against the O_DIRECT NVMe fd, which requires aligned buffers.
+static unsigned char *alloc_aligned(size_t alignment, size_t size)
+{
+    void *ptr;
+    int ret = posix_memalign(&ptr, alignment, size);
+
+    if (ret) {
+        errno = ret;
+        die("posix_memalign");
+    }
+    return ptr;
+}
+
 static struct exporter create_udmabuf(void)
 {
     struct exporter exp = {.name = "udmabuf", .dmabuf_fd = -1, .memfd = -1};
@@ -207,7 +228,7 @@ static void close_exporter(struct exporter *exp)
     }
 }
 
-// Operation 1: fill the exporter's backing store with a known pattern.
+// Op 1 (write half): fill the exporter's backing store with a known pattern.
 static void store_pattern(struct exporter *exp, const unsigned char *pattern)
 {
     if (exp->gpu) {
@@ -234,7 +255,7 @@ static void clear_backing(struct exporter *exp, const unsigned char *zeros)
     require_full(pwrite(exp->memfd, zeros, IO_SIZE, 0), "pwrite zero memfd");
 }
 
-// Operation 4 (verify half): read the exporter's backing store back to host.
+// Op 1 (read half) / op 4: read the exporter's backing store back to host.
 static void load_pattern(struct exporter *exp, unsigned char *out)
 {
     if (exp->gpu) {
@@ -299,11 +320,21 @@ static int fixed_io(struct io_uring *ring, int fd, uint64_t offset, int read)
     return -EAGAIN;
 }
 
-// Operations 2 and 3 (WRITE_FIXED, READ_FIXED) plus pass/fail verdict.
-static int run_test(struct exporter *exp, int nvme_fd, uint64_t offset,
-                    const unsigned char *pattern, const unsigned char *zeros,
-                    unsigned char *actual)
+// Tri-state per-phase verdict: -1 = harness/transport error (never reached
+// this phase's data check), 0 = data mismatch, 1 = pass.
+struct phase_result {
+    int store_ok;
+    int write_ok;
+    int read_ok;
+};
+
+static struct phase_result run_test(struct exporter *exp, int nvme_fd,
+                                    uint64_t offset,
+                                    const unsigned char *pattern,
+                                    const unsigned char *zeros,
+                                    unsigned char *actual)
 {
+    struct phase_result result = {.store_ok = -1, .write_ok = -1, .read_ok = -1};
     struct io_uring ring;
     int ret = io_uring_queue_init(8, &ring, 0);
 
@@ -317,40 +348,68 @@ static int run_test(struct exporter *exp, int nvme_fd, uint64_t offset,
         exit(2);
     }
 
-    store_pattern(exp, pattern);          // op 1
-    ret = fixed_io(&ring, nvme_fd, offset, 0 /* write */);   // op 2
-    if (ret != IO_SIZE) {
+    // Phase 1 (op 1): store, verified by reading the exporter's own backing
+    // store straight back -- no io_uring involved yet.
+    store_pattern(exp, pattern);
+    load_pattern(exp, actual);
+    result.store_ok = memcmp(actual, pattern, IO_SIZE) == 0;
+    printf("%-7s STORE      : %s\n", exp->name, result.store_ok ? "PASS" : "FAIL");
+
+    // Phase 2 (op 2): WRITE_FIXED, verified by a plain pread() ground truth
+    // on the NVMe device. Independent of phase 3 (READ_FIXED never runs).
+    ret = fixed_io(&ring, nvme_fd, offset, 0 /* write */);
+    if (ret == IO_SIZE) {
+        require_full(pread(nvme_fd, actual, IO_SIZE, offset),
+                     "pread ground truth");
+        result.write_ok = memcmp(actual, pattern, IO_SIZE) == 0;
+        printf("%-7s WRITE_FIXED: %s\n", exp->name,
+               result.write_ok ? "PASS" : "FAIL");
+    } else {
         printf("%-7s WRITE_FIXED: ERROR (%s)\n", exp->name,
                ret < 0 ? strerror(-ret) : "short I/O");
-        io_uring_queue_exit(&ring);
-        return -1;
     }
 
+    // Phase 3 (op 3): READ_FIXED, seeded by a plain pwrite() ground truth on
+    // the NVMe device -- independent of phase 2's WRITE_FIXED result. The
+    // buffer is zeroed first so a no-op READ_FIXED can't hide behind phase
+    // 1's leftover correct data.
+    require_full(pwrite(nvme_fd, pattern, IO_SIZE, offset),
+                 "pwrite ground truth");
     clear_backing(exp, zeros);
-    ret = fixed_io(&ring, nvme_fd, offset, 1 /* read */);    // op 3
-    if (ret != IO_SIZE) {
+    ret = fixed_io(&ring, nvme_fd, offset, 1 /* read */);
+    if (ret == IO_SIZE) {
+        load_pattern(exp, actual);        // op 4
+        result.read_ok = memcmp(actual, pattern, IO_SIZE) == 0;
+        printf("%-7s READ_FIXED : %s\n", exp->name,
+               result.read_ok ? "PASS" : "FAIL");
+    } else {
         printf("%-7s READ_FIXED : ERROR (%s)\n", exp->name,
                ret < 0 ? strerror(-ret) : "short I/O");
-        io_uring_queue_exit(&ring);
-        return -1;
     }
 
-    load_pattern(exp, actual);            // op 4
     io_uring_queue_exit(&ring);
+    return result;
+}
 
-    int pass = memcmp(actual, pattern, IO_SIZE) == 0;
-    printf("%-7s round trip: %s\n", exp->name, pass ? "PASS" : "FAIL");
-    return pass;
+static int phase_has_error(const struct phase_result *r)
+{
+    return r->store_ok < 0 || r->write_ok < 0 || r->read_ok < 0;
+}
+
+static int phase_all_pass(const struct phase_result *r)
+{
+    return r->store_ok == 1 && r->write_ok == 1 && r->read_ok == 1;
 }
 
 int main(int argc, char **argv)
 {
     unsigned char *pattern, *zeros, *actual;
     struct exporter udmabuf, amdgpu;
+    struct phase_result udma_result, gpu_result;
     char *end;
     uint64_t offset;
     long page = sysconf(_SC_PAGESIZE);
-    int nvme_fd, udma_pass, gpu_pass;
+    int nvme_fd;
 
     if (argc != 3) {
         fprintf(stderr, "usage: %s /dev/nvmeXnY byte-offset\n", argv[0]);
@@ -366,15 +425,9 @@ int main(int argc, char **argv)
     if (nvme_fd < 0)
         die("open NVMe");
 
-    // No O_DIRECT alignment requirement: these host buffers only ever go
-    // through hipMemcpy or plain memfd pread/pwrite, never against nvme_fd
-    // directly (WRITE_FIXED/READ_FIXED address the dmabuf by fd, not a
-    // host pointer).
-    pattern = malloc(IO_SIZE);
-    zeros = malloc(IO_SIZE);
-    actual = malloc(IO_SIZE);
-    if (!pattern || !zeros || !actual)
-        die("malloc");
+    pattern = alloc_aligned((size_t)page, IO_SIZE);
+    zeros = alloc_aligned((size_t)page, IO_SIZE);
+    actual = alloc_aligned((size_t)page, IO_SIZE);
     memset(pattern, FILL_BYTE, IO_SIZE);
     memset(zeros, 0, IO_SIZE);
 
@@ -382,11 +435,11 @@ int main(int argc, char **argv)
            argv[1], (unsigned long long)offset);
 
     udmabuf = create_udmabuf();
-    udma_pass = run_test(&udmabuf, nvme_fd, offset, pattern, zeros, actual);
+    udma_result = run_test(&udmabuf, nvme_fd, offset, pattern, zeros, actual);
     close_exporter(&udmabuf);
 
     amdgpu = create_amdgpu();
-    gpu_pass = run_test(&amdgpu, nvme_fd, offset, pattern, zeros, actual);
+    gpu_result = run_test(&amdgpu, nvme_fd, offset, pattern, zeros, actual);
     close_exporter(&amdgpu);
 
     close(nvme_fd);
@@ -394,7 +447,7 @@ int main(int argc, char **argv)
     free(zeros);
     free(pattern);
 
-    if (udma_pass < 0 || gpu_pass < 0)
+    if (phase_has_error(&udma_result) || phase_has_error(&gpu_result))
         return 2;
-    return udma_pass && gpu_pass ? 0 : 1;
+    return phase_all_pass(&udma_result) && phase_all_pass(&gpu_result) ? 0 : 1;
 }

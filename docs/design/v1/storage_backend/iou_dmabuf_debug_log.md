@@ -486,15 +486,16 @@ the underlying path is correct.
 | `tools/diagnose_iou_dmabuf_coherency.py` | Raw-`RawBlockDevice` reproducer. Trials coarse vs fine-grained VRAM, and concurrent vs serialized writes. No `RawBlockCore`/backend. This is what isolated the bug below LMCache. |
 | `tools/repro_iou_dmabuf_p2p.c` | **Standalone C** repro (HIP + io_uring, no Python, no LMCache) — for kernel/driver maintainers. See §7. Supports strict per-check accounting, an AMD VRAM vs. `udmabuf` read-destination control, and optional destination poisoning with full-byte classification. |
 | `tools/repro_iou_dmabuf_minimal.c` | **Minimal standalone C** repro (400 lines, one op per direction per exporter) — for pasting directly into a kernel/NVMe/AMD bug report. See §7.4. |
-| `tools/repro_iou_dmabuf_basic.c` | **Stage-1 standalone C** repro — round-trip only (fill, `WRITE_FIXED`, zero, `READ_FIXED`, compare), no direction isolation, no poison classification, no `DMA_BUF_SYNC`. Shows THAT it's broken, not WHICH direction. See §7.5. |
+| `tools/repro_iou_dmabuf_basic.c` | **Stage-1 standalone C** repro — 4 operations (store, `WRITE_FIXED`, `READ_FIXED`, load), each checked against its own independent ground truth. No byte-level poison classification, no `DMA_BUF_SYNC`. Says WHICH of the 4 operations is broken. See §7.5. |
 
 ### How to reproduce the corruption
 
-Simplest ("stage 1", see §7.5) — just proves the round trip fails, does not
-say which direction is broken:
+Smallest that still isolates direction ("stage 1", see §7.5) — 4 operations,
+each independently verified:
 ```bash
 ./repro_iou_dmabuf_basic /dev/nvme0n1 $((4<<30))
-# expect: udmabuf round trip PASS; amdgpu round trip FAIL
+# expect: udmabuf STORE/WRITE_FIXED/READ_FIXED all PASS;
+# amdgpu STORE/WRITE_FIXED PASS, READ_FIXED FAIL
 ```
 
 Smallest reproducer that also isolates direction (see §7.4) — one
@@ -744,30 +745,35 @@ fixed. Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum
 -Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against both the
 patched and a genuinely stock liburing header tree.
 
-### 7.5 Basic ("stage 1") round-trip reproducer
+### 7.5 Basic ("stage 1") per-phase reproducer
 
-`tools/repro_iou_dmabuf_basic.c` (~280 lines) is even smaller than §7.4's
-minimal repro and comes first in the investigation narrative: the naive
-round-trip test anyone would write first, before reaching for direction
-isolation. Per exporter (`udmabuf` then AMD VRAM), it does exactly 4
-operations against a single buffer:
+`tools/repro_iou_dmabuf_basic.c` (~330 lines) is smaller than §7.4's minimal
+repro and comes first in the investigation narrative. Per exporter (`udmabuf`
+then AMD VRAM), it runs 4 operations, each checked against its own
+independent ground truth (not just an overall round-trip `memcmp`):
 
-1. **Store**: fill the buffer with a known repeated-byte pattern (`0xAB`).
-2. **`WRITE_FIXED`** the buffer to NVMe.
-3. **`READ_FIXED`** the same NVMe region back into the buffer.
-4. **Load + compare**: read the buffer back to host and `memcmp` against the
-   pattern.
+1. **STORE**: fill the buffer with a known repeated-byte pattern (`0xAB`),
+   then read it straight back through the exporter itself (no io_uring) —
+   confirms the exporter's own set/get path works before layering io_uring
+   on top of it.
+2. **`WRITE_FIXED`**: buffer → NVMe, checked with a plain `pread()` ground
+   truth on the device. Independent of phase 3 — `READ_FIXED` never runs
+   here, so this result can't be an artifact of the read direction.
+3. **`READ_FIXED`**: NVMe → buffer, seeded by a plain `pwrite()` ground truth
+   on the device (independent of phase 2's `WRITE_FIXED` result) and
+   preceded by zeroing the buffer, so a no-op `READ_FIXED` can't hide behind
+   phase 1's leftover correct data.
 
-A zero-out is inserted between steps 2 and 3 (not counted as one of the 4
-"real" operations, but structurally required): without it, a `READ_FIXED`
-that silently does nothing would leave step 1's correct data in place and
-the test would falsely PASS — exactly the AMD failure mode this is meant to
-show.
+Each phase prints its own `STORE`/`WRITE_FIXED`/`READ_FIXED` PASS/FAIL/ERROR
+line, so unlike an earlier round-trip-only version of this file, a single run
+now tells you not just THAT something is broken but WHICH of the 4 operations
+is broken — this is exactly the "how do we know if read failed or write
+failed" question from §5.1's investigation, answered at the smallest possible
+scale.
 
-**Deliberately dropped versus §7.4:** independent ground-truth `pread`/`pwrite`
-side-channel (so it cannot say *which* direction failed, only that the round
-trip did), poison-byte classification (`0xAB` zero-out vs. `0xFF`-XOR
-complement with `expected`/`poison`/`other` counts), and `DMA_BUF_SYNC`.
+**Deliberately dropped versus §7.4:** byte-level poison classification (plain
+`memcmp` per phase here, not `expected`/`poison`/`other` counts), and
+`DMA_BUF_SYNC`.
 
 **Why no `DMA_BUF_SYNC`:** that ioctl only matters for CPU access to a dmabuf
 through its own `mmap()` — a different consumption path than what this test
@@ -781,6 +787,12 @@ needed for that in either exporter. `DMA_BUF_SYNC` only appears in §7.4
 because that repro chooses to verify udmabuf contents via `mmap()` instead;
 it does not test the WRITE_FIXED/READ_FIXED path any harder.
 
+Because phases 2 and 3 now go directly against the `O_DIRECT` NVMe fd for
+their ground-truth `pread`/`pwrite`, the host pattern/zero/actual buffers
+must be page-aligned (`posix_memalign`), unlike the very first version of
+this file, which only ever touched `hipMemcpy` or plain `memfd` I/O and had
+no such requirement.
+
 Like §7.4, this redeclares its own minimal dma-buf registration ABI structs
 and calls them via the raw `io_uring_register(2)` syscall, so it builds
 against any stock `liburing-dev`. Verified: strict-warning build (`-Wall
@@ -789,8 +801,12 @@ against a genuinely stock (pre-dma-buf-patch) liburing header tree.
 
 Expected output on this hardware:
 ```
-udmabuf round trip: PASS
-amdgpu  round trip: FAIL
+udmabuf STORE      : PASS
+udmabuf WRITE_FIXED: PASS
+udmabuf READ_FIXED : PASS
+amdgpu  STORE      : PASS
+amdgpu  WRITE_FIXED: PASS
+amdgpu  READ_FIXED : FAIL
 ```
 
 ---

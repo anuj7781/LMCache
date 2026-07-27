@@ -708,24 +708,33 @@ AMD VRAM), it runs exactly one isolated `WRITE_FIXED` and one isolated
   should rule it out independently rather than rely on the larger tool's
   weaker pattern.
 
-**Build note:** this file includes `<liburing.h>` and uses
+**Build note:** originally this file included `<liburing.h>` and used
 `io_uring_regbuf_desc`/`IO_REGBUF_TYPE_DMABUF` directly from the header,
-unlike `repro_iou_dmabuf_p2p.c` (§7.1–§7.3), which redeclares its own minimal
-copies of those structs specifically so it can build against any stock
-liburing. This file needs `-I` pointed at the **patched** liburing checkout
-(the one whose `io_uring/io_uring.h` adds dma-buf token support) at compile
-time; a stock/unpatched `liburing-dev` will fail to compile it. No newer
-*runtime* library is required — link with a plain `-luring` either way, since
-these additions are header-level struct/macro definitions dispatched through
-the existing `io_uring_register()` syscall wrapper.
+which required `-I` pointed at the patched liburing checkout. It was changed
+to match `repro_iou_dmabuf_p2p.c` (§7.1–§7.3): it now redeclares its own
+minimal, `repro_`-prefixed copies of the registration structs
+(`repro_regbuf_desc`, `repro_rsrc_register`, `repro_rsrc_update2`,
+`REPRO_REGBUF_TYPE_DMABUF`, `REPRO_RSRC_UPDATE_EXTENDED`) and issues the
+`IORING_REGISTER_BUFFERS2`/`IORING_REGISTER_BUFFERS_UPDATE` calls via a raw
+`syscall(__NR_io_uring_register, ...)` instead of relying on the patched
+header's types or the `io_uring_register_buffers_sparse()` liburing helper.
+Everything else (`io_uring_queue_init`, `io_uring_get_sqe`,
+`io_uring_prep_read_fixed`/`prep_write_fixed`, `io_uring_submit`,
+`io_uring_wait_cqe`, `io_uring_queue_exit`) is stock liburing API. Net effect:
+this file now builds against **any ordinary, unpatched `liburing-dev`** — no
+`-I` override needed. The kernel under test still needs
+`CONFIG_DMABUF_TOKEN=y`; only the build-time header dependency was removed.
+Verified by compiling against a real pre-dma-buf-patch liburing header tree
+(checked out at the commit immediately before `a1f1f8a1` in the local
+liburing clone) with zero errors.
 
 Exit code is 1 only if the exact observed signature reproduces (`udmabuf`
 write+read PASS, AMD VRAM write PASS + read FAIL), 2 on any harness/transport
 error, 0 otherwise (including "everything passed" or an unrelated failure
 pattern) — usable as a regression check once this is filed and eventually
 fixed. Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum
--Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against the patched
-liburing headers.
+-Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against both the
+patched and a genuinely stock liburing header tree.
 
 ---
 

@@ -8,24 +8,21 @@
 //
 // WARNING: overwrites 2 MiB at the supplied raw-device offset.
 //
-// DEPENDS ON THE PATCHED liburing HEADERS. Unlike repro_iou_dmabuf_p2p.c (which
-// redeclares its own minimal io_uring_regbuf_desc/IO_REGBUF_TYPE_DMABUF structs
-// to build against any stock liburing), this file includes <liburing.h> and
-// uses those symbols directly from the header. A stock/unpatched liburing-dev
-// does NOT define them and this will fail to compile with "unknown type name
-// 'struct io_uring_regbuf_desc'" or similar. Point -I at the patched liburing
-// checkout's src/include directory (the one with the top commit adding dma-buf
-// token support -- io_uring/io_uring.h there defines these structs). No newer
-// *runtime* library is required: these additions are header-level struct/macro
-// definitions dispatched through the existing io_uring_register() syscall
-// wrapper, so linking against any liburing.so (even a stock one, via -luring)
-// is fine as long as the *headers* used at compile time are the patched ones.
+// Like repro_iou_dmabuf_p2p.c, this file redeclares its own minimal copy of the
+// dma-buf token registration ABI (repro_regbuf_desc / REPRO_REGBUF_TYPE_DMABUF /
+// etc., prefixed to avoid clashing with any real liburing symbols) and issues the
+// registration call via the raw io_uring_register(2) syscall instead of going
+// through liburing helpers for it. Everything else (queue_init, get_sqe,
+// prep_read_fixed/prep_write_fixed, submit, wait_cqe, queue_exit) is stock
+// liburing API available in any liburing-dev. This means the file builds
+// against an ORDINARY, UNPATCHED liburing install -- no patched header checkout
+// or -I needed. The kernel itself still needs CONFIG_DMABUF_TOKEN=y support;
+// only the *build-time headers* are decoupled from that.
 //
 // Build:
 //   SRC=tools/repro_iou_dmabuf_minimal.c
-//   URING_INC=/path/to/patched/liburing/src/include   # adjust to your checkout
 //   LIBS='-luring -L/opt/rocm/lib -lamdhip64'
-//   cc -O2 -I"$URING_INC" -o repro_iou_dmabuf_minimal "$SRC" $LIBS
+//   cc -O2 -o repro_iou_dmabuf_minimal "$SRC" $LIBS
 //   # If -lamdhip64 is not found (runtime-only ROCm, no unversioned .so
 //   # symlink), link the versioned soname directly instead of -lamdhip64:
 //   #   "$(ls /opt/rocm*/lib/libamdhip64.so* 2>/dev/null | head -1)"
@@ -48,6 +45,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define IO_SIZE (2U * 1024U * 1024U)
@@ -73,6 +71,55 @@ extern hipError_t hipMemGetHandleForAddressRange(void *handle,
                                                  size_t size, int type,
                                                  unsigned long long flags);
 extern const char *hipGetErrorString(hipError_t error);
+
+// ---- io_uring dma-buf token ABI (patched kernel; define defensively) --------
+// Own minimal copy of the registration structs, matching repro_iou_dmabuf_p2p.c.
+// Never taken from <liburing.h>, so this builds against any stock liburing-dev.
+#ifndef IORING_REGISTER_BUFFERS2
+#define IORING_REGISTER_BUFFERS2 15
+#endif
+#ifndef IORING_REGISTER_BUFFERS_UPDATE
+#define IORING_REGISTER_BUFFERS_UPDATE 16
+#endif
+#ifndef IORING_RSRC_REGISTER_SPARSE
+#define IORING_RSRC_REGISTER_SPARSE (1u << 0)
+#endif
+#define REPRO_RSRC_UPDATE_EXTENDED (1u << 1)
+#define REPRO_REGBUF_TYPE_DMABUF 2
+
+struct repro_rsrc_register {
+    uint32_t nr;
+    uint32_t flags;
+    uint64_t resv2;
+    uint64_t data;
+    uint64_t tags;
+};
+
+struct repro_rsrc_update2 {
+    uint32_t offset;
+    uint32_t flags;  // REPRO_RSRC_UPDATE_EXTENDED for dma-buf
+    uint64_t data;   // pointer to a repro_regbuf_desc
+    uint64_t tags;
+    uint32_t nr;
+    uint32_t resv2;
+};
+
+struct repro_regbuf_desc {
+    uint32_t type;   // REPRO_REGBUF_TYPE_DMABUF
+    uint32_t flags;
+    uint64_t size;   // must be 0 for dma-buf
+    uint64_t uaddr;  // must be 0 for dma-buf
+    int32_t dmabuf_fd;
+    int32_t target_fd;  // the O_DIRECT block fd
+    uint64_t __resv[6];
+};
+
+static int io_uring_register_raw(int ring_fd, unsigned opcode, void *arg,
+                                 unsigned nr)
+{
+    long r = syscall(__NR_io_uring_register, ring_fd, opcode, arg, nr);
+    return (int)r;
+}
 
 struct test_buffer {
     const char *name;
@@ -272,22 +319,26 @@ static int fixed_io(struct io_uring *ring, int fd, uint64_t offset, int read)
 
 static int register_buffer(struct io_uring *ring, int nvme_fd, int dmabuf_fd)
 {
-    struct io_uring_regbuf_desc desc = {
-        .type = IO_REGBUF_TYPE_DMABUF,
-        .dmabuf_fd = dmabuf_fd,
-        .target_fd = nvme_fd,
-    };
-    struct io_uring_rsrc_update2 update = {
-        .resv = IORING_RSRC_UPDATE_EXTENDED,
-        .data = (uint64_t)(uintptr_t)&desc,
-        .nr = 1,
-    };
-    int ret = io_uring_register_buffers_sparse(ring, 1);
+    struct repro_rsrc_register reg = {0};
+    struct repro_regbuf_desc desc = {0};
+    struct repro_rsrc_update2 update = {0};
+    int ret;
 
+    reg.nr = 1;
+    reg.flags = IORING_RSRC_REGISTER_SPARSE;
+    ret = io_uring_register_raw(ring->ring_fd, IORING_REGISTER_BUFFERS2, &reg,
+                                sizeof(reg));
     if (ret < 0)
         return ret;
-    ret = io_uring_register(ring->ring_fd, IORING_REGISTER_BUFFERS_UPDATE,
-                            &update, sizeof(update));
+
+    desc.type = REPRO_REGBUF_TYPE_DMABUF;
+    desc.dmabuf_fd = dmabuf_fd;
+    desc.target_fd = nvme_fd;
+    update.flags = REPRO_RSRC_UPDATE_EXTENDED;
+    update.data = (uint64_t)(uintptr_t)&desc;
+    update.nr = 1;
+    ret = io_uring_register_raw(ring->ring_fd, IORING_REGISTER_BUFFERS_UPDATE,
+                                &update, sizeof(update));
     return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
 }
 

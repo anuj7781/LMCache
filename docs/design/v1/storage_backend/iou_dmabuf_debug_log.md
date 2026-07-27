@@ -793,11 +793,29 @@ must be page-aligned (`posix_memalign`), unlike the very first version of
 this file, which only ever touched `hipMemcpy` or plain `memfd` I/O and had
 no such requirement.
 
-Like §7.4, this redeclares its own minimal dma-buf registration ABI structs
-and calls them via the raw `io_uring_register(2)` syscall, so it builds
-against any stock `liburing-dev`. Verified: strict-warning build (`-Wall
--Wextra -Wswitch-enum -Wformat=2`) and `gcc -fanalyzer`, both zero warnings,
-against a genuinely stock (pre-dma-buf-patch) liburing header tree.
+**Prepared for sharing with kernel/NVMe/AMD maintainers**, so it was cleaned
+up: no mention of this debug log or the sibling `repro_iou_dmabuf_p2p.c` /
+`repro_iou_dmabuf_minimal.c` tools, phase-by-phase inline comments condensed
+into the single top-of-file summary, and the EAGAIN retry loop dropped from
+`fixed_io()` (a single submit + wait is enough for this file's purpose; the
+retry loop matters for `repro_iou_dmabuf_p2p.c`'s longer stress runs, not
+here).
+
+It also reverted the self-contained-ABI trick used by `repro_iou_dmabuf_p2p.c`
+and `repro_iou_dmabuf_minimal.c` (redeclaring `repro_`-prefixed copies of the
+dma-buf registration structs and calling them via the raw
+`io_uring_register(2)` syscall to build against any stock `liburing-dev`).
+That trick existed only for *our* convenience compiling on boxes without the
+patched liburing checked out — the maintainers this file is going to are the
+ones who *have* the patched kernel/liburing (they're implementing this
+feature), so using the real `<liburing.h>` types
+(`io_uring_regbuf_desc`/`IO_REGBUF_TYPE_DMABUF`/etc.) directly is both
+simpler and safer: it can't silently drift from the real ABI the way a
+hand-copied struct could if the interface changes during review. Consequence:
+this file now needs a **patched** liburing to compile, unlike §7.1–§7.4's
+tools. Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum
+-Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against the patched
+liburing header tree.
 
 Expected output on this hardware:
 ```

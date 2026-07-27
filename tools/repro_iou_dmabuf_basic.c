@@ -1,41 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Stage-1 minimal io_uring DMA-BUF test.
+// io_uring DMA-BUF read/write reproducer: AMD GPU VRAM vs. udmabuf.
 //
-// For each exporter (udmabuf, then AMD VRAM), runs 4 operations and verifies
-// each one independently against its own ground truth:
+// Registers a 2 MiB dma-buf with io_uring against an NVMe block device and
+// runs 4 checks against it, once for a udmabuf (host-memory-backed) buffer
+// and once for AMD GPU VRAM:
 //
-//   1. STORE:       fill the exporter's backing store with a known pattern,
-//                   then read it straight back through the exporter itself
-//                   (no io_uring) to confirm the exporter's own set/get path
-//                   works before layering io_uring on top of it.
-//   2. WRITE_FIXED:  buffer -> NVMe, checked with a plain pread() ground
-//                    truth on the device. Bypasses READ_FIXED entirely, so
-//                    this result does not depend on phase 3.
-//   3. READ_FIXED:   NVMe -> buffer, seeded by a plain pwrite() ground truth
-//                    on the device (independent of phase 2's WRITE_FIXED)
-//                    and preceded by zeroing the buffer, so a no-op
-//                    READ_FIXED can't hide behind phase 1's leftover data.
+//   1. STORE       - write a known pattern into the buffer, then read it
+//                    straight back through the buffer's own API (no
+//                    io_uring), to confirm the buffer itself is sane.
+//   2. WRITE_FIXED - write the buffer to the NVMe device via io_uring, then
+//                    verify with a plain pread() on the device.
+//   3. READ_FIXED  - write a known pattern to the NVMe device with a plain
+//                    pwrite(), zero the buffer (so a no-op read can't hide
+//                    behind stale data), then read it back via io_uring and
+//                    compare.
 //
-// Each phase prints its own PASS/FAIL/ERROR, so a run tells you not just
-// THAT something is broken but WHICH of the 4 operations is broken --
-// without stage 2's byte-level poison classification (plain memcmp here,
-// not expected/poison/other counts) and without DMA_BUF_SYNC. See
-// docs/design/v1/storage_backend/iou_dmabuf_debug_log.md ("basic" vs
-// "minimal" reproducer) for why those two are unneeded here.
+// Each check prints its own PASS/FAIL, so the output shows exactly which
+// operation is broken. On the AMD hardware this was found on: WRITE_FIXED
+// passes, READ_FIXED fails (the destination is left unchanged), for the
+// GPU VRAM buffer only -- udmabuf passes both.
 //
-// Like repro_iou_dmabuf_p2p.c and repro_iou_dmabuf_minimal.c, this redeclares
-// its own minimal copy of the dma-buf registration ABI and calls it via the
-// raw io_uring_register(2) syscall, so it builds against any stock
-// liburing-dev -- no patched headers needed.
-//
-// WARNING: overwrites 2 MiB at the supplied raw-device offset.
+// WARNING: overwrites 2 MiB at the given device offset.
 //
 // Build:
-//   cc -O2 -o repro_iou_dmabuf_basic tools/repro_iou_dmabuf_basic.c -luring -L/opt/rocm/lib -lamdhip64
+//   cc -O2 -o repro_iou_dmabuf_basic repro_iou_dmabuf_basic.c -luring -L/opt/rocm/lib -lamdhip64
 //
 // Run:
-//   ./repro_iou_dmabuf_basic /dev/nvme0n1 $((4<<30))
+//   ./repro_iou_dmabuf_basic /dev/nvme0n1 <byte-offset>
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -49,13 +41,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #define IO_SIZE (2U * 1024U * 1024U)
 #define FILL_BYTE 0xAB
-#define RETRIES 1000
 
+// Declared here so this builds with a plain C compiler against a
+// runtime-only ROCm install (libamdhip64.so) -- no HIP dev headers needed.
 typedef int hipError_t;
 typedef void *hipDeviceptr_t;
 enum {
@@ -77,55 +69,7 @@ extern hipError_t hipMemGetHandleForAddressRange(void *handle,
                                                  unsigned long long flags);
 extern const char *hipGetErrorString(hipError_t error);
 
-// ---- io_uring dma-buf token ABI (patched kernel; define defensively) --------
-// Own minimal copy, matching repro_iou_dmabuf_p2p.c / repro_iou_dmabuf_minimal.c.
-#ifndef IORING_REGISTER_BUFFERS2
-#define IORING_REGISTER_BUFFERS2 15
-#endif
-#ifndef IORING_REGISTER_BUFFERS_UPDATE
-#define IORING_REGISTER_BUFFERS_UPDATE 16
-#endif
-#ifndef IORING_RSRC_REGISTER_SPARSE
-#define IORING_RSRC_REGISTER_SPARSE (1u << 0)
-#endif
-#define REPRO_RSRC_UPDATE_EXTENDED (1u << 1)
-#define REPRO_REGBUF_TYPE_DMABUF 2
-
-struct repro_rsrc_register {
-    uint32_t nr;
-    uint32_t flags;
-    uint64_t resv2;
-    uint64_t data;
-    uint64_t tags;
-};
-
-struct repro_rsrc_update2 {
-    uint32_t offset;
-    uint32_t flags;
-    uint64_t data;
-    uint64_t tags;
-    uint32_t nr;
-    uint32_t resv2;
-};
-
-struct repro_regbuf_desc {
-    uint32_t type;
-    uint32_t flags;
-    uint64_t size;
-    uint64_t uaddr;
-    int32_t dmabuf_fd;
-    int32_t target_fd;
-    uint64_t __resv[6];
-};
-
-static int io_uring_register_raw(int ring_fd, unsigned opcode, void *arg,
-                                 unsigned nr)
-{
-    long r = syscall(__NR_io_uring_register, ring_fd, opcode, arg, nr);
-    return (int)r;
-}
-
-// One exporter under test: either a udmabuf (host memfd-backed) or an AMD
+// One buffer under test: either a udmabuf (host memfd-backed) or an AMD GPU
 // VRAM allocation. Exactly one of {memfd, gpu_ptr} is meaningful per kind.
 struct exporter {
     const char *name;
@@ -160,8 +104,8 @@ static void require_full(ssize_t ret, const char *what)
     exit(2);
 }
 
-// Page-aligned: these buffers are used for direct pread()/pwrite() ground
-// truth against the O_DIRECT NVMe fd, which requires aligned buffers.
+// Page-aligned: used for pread()/pwrite() ground truth against the
+// O_DIRECT NVMe fd, which requires aligned buffers.
 static unsigned char *alloc_aligned(size_t alignment, size_t size)
 {
     void *ptr;
@@ -228,7 +172,6 @@ static void close_exporter(struct exporter *exp)
     }
 }
 
-// Op 1 (write half): fill the exporter's backing store with a known pattern.
 static void store_pattern(struct exporter *exp, const unsigned char *pattern)
 {
     if (exp->gpu) {
@@ -239,12 +182,10 @@ static void store_pattern(struct exporter *exp, const unsigned char *pattern)
         return;
     }
     // Plain pwrite on the memfd -- same physical pages the dmabuf wraps.
-    // No mmap, no DMA_BUF_SYNC: we're not going through the dma-buf mmap
-    // fop at all.
+    // No mmap, so DMA_BUF_SYNC does not apply here.
     require_full(pwrite(exp->memfd, pattern, IO_SIZE, 0), "pwrite memfd");
 }
 
-// Required reset so a no-op READ_FIXED can't hide behind leftover data.
 static void clear_backing(struct exporter *exp, const unsigned char *zeros)
 {
     if (exp->gpu) {
@@ -255,7 +196,6 @@ static void clear_backing(struct exporter *exp, const unsigned char *zeros)
     require_full(pwrite(exp->memfd, zeros, IO_SIZE, 0), "pwrite zero memfd");
 }
 
-// Op 1 (read half) / op 4: read the exporter's backing store back to host.
 static void load_pattern(struct exporter *exp, unsigned char *out)
 {
     if (exp->gpu) {
@@ -268,60 +208,48 @@ static void load_pattern(struct exporter *exp, unsigned char *out)
 
 static int register_buffer(struct io_uring *ring, int nvme_fd, int dmabuf_fd)
 {
-    struct repro_rsrc_register reg = {0};
-    struct repro_regbuf_desc desc = {0};
-    struct repro_rsrc_update2 update = {0};
-    int ret;
+    struct io_uring_regbuf_desc desc = {
+        .type = IO_REGBUF_TYPE_DMABUF,
+        .dmabuf_fd = dmabuf_fd,
+        .target_fd = nvme_fd,
+    };
+    struct io_uring_rsrc_update2 update = {
+        .resv = IORING_RSRC_UPDATE_EXTENDED,
+        .data = (uint64_t)(uintptr_t)&desc,
+        .nr = 1,
+    };
+    int ret = io_uring_register_buffers_sparse(ring, 1);
 
-    reg.nr = 1;
-    reg.flags = IORING_RSRC_REGISTER_SPARSE;
-    ret = io_uring_register_raw(ring->ring_fd, IORING_REGISTER_BUFFERS2, &reg,
-                                sizeof(reg));
     if (ret < 0)
         return ret;
-
-    desc.type = REPRO_REGBUF_TYPE_DMABUF;
-    desc.dmabuf_fd = dmabuf_fd;
-    desc.target_fd = nvme_fd;
-    update.flags = REPRO_RSRC_UPDATE_EXTENDED;
-    update.data = (uint64_t)(uintptr_t)&desc;
-    update.nr = 1;
-    ret = io_uring_register_raw(ring->ring_fd, IORING_REGISTER_BUFFERS_UPDATE,
-                                &update, sizeof(update));
+    ret = io_uring_register(ring->ring_fd, IORING_REGISTER_BUFFERS_UPDATE,
+                            &update, sizeof(update));
     return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
 }
 
-// EAGAIN retry is part of the API contract (dma-buf mapping invalidation can
-// legitimately return it a few times), not optional test complexity.
 static int fixed_io(struct io_uring *ring, int fd, uint64_t offset, int read)
 {
-    for (int attempt = 0; attempt < RETRIES; attempt++) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-        struct io_uring_cqe *cqe;
-        int ret;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    struct io_uring_cqe *cqe;
+    int ret;
 
-        if (!sqe)
-            return -ENOSPC;
-        if (read)
-            io_uring_prep_read_fixed(sqe, fd, NULL, IO_SIZE, offset, 0);
-        else
-            io_uring_prep_write_fixed(sqe, fd, NULL, IO_SIZE, offset, 0);
-        ret = io_uring_submit(ring);
-        if (ret < 0)
-            return ret;
-        ret = io_uring_wait_cqe(ring, &cqe);
-        if (ret < 0)
-            return ret;
-        ret = cqe->res;
-        io_uring_cqe_seen(ring, cqe);
-        if (ret != -EAGAIN)
-            return ret;
-    }
-    return -EAGAIN;
+    if (read)
+        io_uring_prep_read_fixed(sqe, fd, NULL, IO_SIZE, offset, 0);
+    else
+        io_uring_prep_write_fixed(sqe, fd, NULL, IO_SIZE, offset, 0);
+    ret = io_uring_submit(ring);
+    if (ret < 0)
+        return ret;
+    ret = io_uring_wait_cqe(ring, &cqe);
+    if (ret < 0)
+        return ret;
+    ret = cqe->res;
+    io_uring_cqe_seen(ring, cqe);
+    return ret;
 }
 
-// Tri-state per-phase verdict: -1 = harness/transport error (never reached
-// this phase's data check), 0 = data mismatch, 1 = pass.
+// Tri-state per-check verdict: -1 = harness/transport error, 0 = data
+// mismatch, 1 = pass.
 struct phase_result {
     int store_ok;
     int write_ok;
@@ -348,15 +276,11 @@ static struct phase_result run_test(struct exporter *exp, int nvme_fd,
         exit(2);
     }
 
-    // Phase 1 (op 1): store, verified by reading the exporter's own backing
-    // store straight back -- no io_uring involved yet.
     store_pattern(exp, pattern);
     load_pattern(exp, actual);
     result.store_ok = memcmp(actual, pattern, IO_SIZE) == 0;
     printf("%-7s STORE      : %s\n", exp->name, result.store_ok ? "PASS" : "FAIL");
 
-    // Phase 2 (op 2): WRITE_FIXED, verified by a plain pread() ground truth
-    // on the NVMe device. Independent of phase 3 (READ_FIXED never runs).
     ret = fixed_io(&ring, nvme_fd, offset, 0 /* write */);
     if (ret == IO_SIZE) {
         require_full(pread(nvme_fd, actual, IO_SIZE, offset),
@@ -369,16 +293,12 @@ static struct phase_result run_test(struct exporter *exp, int nvme_fd,
                ret < 0 ? strerror(-ret) : "short I/O");
     }
 
-    // Phase 3 (op 3): READ_FIXED, seeded by a plain pwrite() ground truth on
-    // the NVMe device -- independent of phase 2's WRITE_FIXED result. The
-    // buffer is zeroed first so a no-op READ_FIXED can't hide behind phase
-    // 1's leftover correct data.
     require_full(pwrite(nvme_fd, pattern, IO_SIZE, offset),
                  "pwrite ground truth");
     clear_backing(exp, zeros);
     ret = fixed_io(&ring, nvme_fd, offset, 1 /* read */);
     if (ret == IO_SIZE) {
-        load_pattern(exp, actual);        // op 4
+        load_pattern(exp, actual);
         result.read_ok = memcmp(actual, pattern, IO_SIZE) == 0;
         printf("%-7s READ_FIXED : %s\n", exp->name,
                result.read_ok ? "PASS" : "FAIL");

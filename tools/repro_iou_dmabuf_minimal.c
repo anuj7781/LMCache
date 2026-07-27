@@ -8,10 +8,27 @@
 //
 // WARNING: overwrites 2 MiB at the supplied raw-device offset.
 //
+// DEPENDS ON THE PATCHED liburing HEADERS. Unlike repro_iou_dmabuf_p2p.c (which
+// redeclares its own minimal io_uring_regbuf_desc/IO_REGBUF_TYPE_DMABUF structs
+// to build against any stock liburing), this file includes <liburing.h> and
+// uses those symbols directly from the header. A stock/unpatched liburing-dev
+// does NOT define them and this will fail to compile with "unknown type name
+// 'struct io_uring_regbuf_desc'" or similar. Point -I at the patched liburing
+// checkout's src/include directory (the one with the top commit adding dma-buf
+// token support -- io_uring/io_uring.h there defines these structs). No newer
+// *runtime* library is required: these additions are header-level struct/macro
+// definitions dispatched through the existing io_uring_register() syscall
+// wrapper, so linking against any liburing.so (even a stock one, via -luring)
+// is fine as long as the *headers* used at compile time are the patched ones.
+//
 // Build:
 //   SRC=tools/repro_iou_dmabuf_minimal.c
+//   URING_INC=/path/to/patched/liburing/src/include   # adjust to your checkout
 //   LIBS='-luring -L/opt/rocm/lib -lamdhip64'
-//   cc -O2 -o repro_iou_dmabuf_minimal "$SRC" $LIBS
+//   cc -O2 -I"$URING_INC" -o repro_iou_dmabuf_minimal "$SRC" $LIBS
+//   # If -lamdhip64 is not found (runtime-only ROCm, no unversioned .so
+//   # symlink), link the versioned soname directly instead of -lamdhip64:
+//   #   "$(ls /opt/rocm*/lib/libamdhip64.so* 2>/dev/null | head -1)"
 //
 // Run:
 //   ./repro_iou_dmabuf_minimal /dev/nvme0n1 $((4<<30))

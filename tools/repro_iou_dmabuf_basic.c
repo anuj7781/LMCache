@@ -21,15 +21,6 @@
 // passes, READ_FIXED fails (the destination is left unchanged), for the
 // GPU VRAM buffer only -- udmabuf passes both.
 //
-// This registers the dma-buf via the DMA-BUF buffer-registration extension
-// to io_uring (struct io_uring_regbuf_desc / IO_REGBUF_TYPE_DMABUF), which
-// is not yet merged upstream, so it is unlikely to be in whatever liburing
-// you have installed. The struct and its two constants are defined locally
-// below (under different names, to avoid clashing with any liburing that
-// does have them). Everything else this program uses is ordinary, long
-// since released liburing/HIP API -- an ordinary liburing install is all
-// that's otherwise needed.
-//
 // WARNING: overwrites 2 MiB at the given device offset.
 //
 // Build:
@@ -78,10 +69,6 @@ extern hipError_t hipMemGetHandleForAddressRange(void *handle,
                                                  unsigned long long flags);
 extern const char *hipGetErrorString(hipError_t error);
 
-// Not-yet-upstream: the new registration type used to bind a dma-buf fd to
-// an io_uring instance. type = DMABUF_REGBUF_TYPE selects the dma-buf-fd
-// variant of the union that this struct otherwise represents; size and
-// uaddr must be left 0 for that variant.
 #define DMABUF_REGBUF_TYPE 2
 #define DMABUF_RSRC_UPDATE_EXTENDED (1u << 1)
 
@@ -95,8 +82,7 @@ struct dmabuf_regbuf_desc {
     uint64_t __resv[6];
 };
 
-// One buffer under test: either a udmabuf (host memfd-backed) or an AMD GPU
-// VRAM allocation. Exactly one of {memfd, gpu_ptr} is meaningful per kind.
+// Exactly one of {memfd, gpu_ptr} is meaningful, depending on gpu.
 struct exporter {
     const char *name;
     int gpu;
@@ -207,8 +193,6 @@ static void store_pattern(struct exporter *exp, const unsigned char *pattern)
         hip_check(hipDeviceSynchronize(), "hipDeviceSynchronize");
         return;
     }
-    // Plain pwrite on the memfd -- same physical pages the dmabuf wraps.
-    // No mmap, so DMA_BUF_SYNC does not apply here.
     require_full(pwrite(exp->memfd, pattern, IO_SIZE, 0), "pwrite memfd");
 }
 

@@ -486,11 +486,19 @@ the underlying path is correct.
 | `tools/diagnose_iou_dmabuf_coherency.py` | Raw-`RawBlockDevice` reproducer. Trials coarse vs fine-grained VRAM, and concurrent vs serialized writes. No `RawBlockCore`/backend. This is what isolated the bug below LMCache. |
 | `tools/repro_iou_dmabuf_p2p.c` | **Standalone C** repro (HIP + io_uring, no Python, no LMCache) — for kernel/driver maintainers. See §7. Supports strict per-check accounting, an AMD VRAM vs. `udmabuf` read-destination control, and optional destination poisoning with full-byte classification. |
 | `tools/repro_iou_dmabuf_minimal.c` | **Minimal standalone C** repro (400 lines, one op per direction per exporter) — for pasting directly into a kernel/NVMe/AMD bug report. See §7.4. |
+| `tools/repro_iou_dmabuf_basic.c` | **Stage-1 standalone C** repro — round-trip only (fill, `WRITE_FIXED`, zero, `READ_FIXED`, compare), no direction isolation, no poison classification, no `DMA_BUF_SYNC`. Shows THAT it's broken, not WHICH direction. See §7.5. |
 
 ### How to reproduce the corruption
 
-Smallest and most shareable (see §7.4) — one `WRITE_FIXED` and one `READ_FIXED`
-per exporter, no repeats needed:
+Simplest ("stage 1", see §7.5) — just proves the round trip fails, does not
+say which direction is broken:
+```bash
+./repro_iou_dmabuf_basic /dev/nvme0n1 $((4<<30))
+# expect: udmabuf round trip PASS; amdgpu round trip FAIL
+```
+
+Smallest reproducer that also isolates direction (see §7.4) — one
+`WRITE_FIXED` and one `READ_FIXED` per exporter, no repeats needed:
 ```bash
 ./repro_iou_dmabuf_minimal /dev/nvme0n1 $((4<<30))
 # expect: udmabuf WRITE_FIXED/READ_FIXED PASS/PASS; amdgpu WRITE_FIXED PASS,
@@ -735,6 +743,55 @@ pattern) — usable as a regression check once this is filed and eventually
 fixed. Verified: strict-warning build (`-Wall -Wextra -Wswitch-enum
 -Wformat=2`) and `gcc -fanalyzer`, both zero warnings, against both the
 patched and a genuinely stock liburing header tree.
+
+### 7.5 Basic ("stage 1") round-trip reproducer
+
+`tools/repro_iou_dmabuf_basic.c` (~280 lines) is even smaller than §7.4's
+minimal repro and comes first in the investigation narrative: the naive
+round-trip test anyone would write first, before reaching for direction
+isolation. Per exporter (`udmabuf` then AMD VRAM), it does exactly 4
+operations against a single buffer:
+
+1. **Store**: fill the buffer with a known repeated-byte pattern (`0xAB`).
+2. **`WRITE_FIXED`** the buffer to NVMe.
+3. **`READ_FIXED`** the same NVMe region back into the buffer.
+4. **Load + compare**: read the buffer back to host and `memcmp` against the
+   pattern.
+
+A zero-out is inserted between steps 2 and 3 (not counted as one of the 4
+"real" operations, but structurally required): without it, a `READ_FIXED`
+that silently does nothing would leave step 1's correct data in place and
+the test would falsely PASS — exactly the AMD failure mode this is meant to
+show.
+
+**Deliberately dropped versus §7.4:** independent ground-truth `pread`/`pwrite`
+side-channel (so it cannot say *which* direction failed, only that the round
+trip did), poison-byte classification (`0xAB` zero-out vs. `0xFF`-XOR
+complement with `expected`/`poison`/`other` counts), and `DMA_BUF_SYNC`.
+
+**Why no `DMA_BUF_SYNC`:** that ioctl only matters for CPU access to a dmabuf
+through its own `mmap()` — a different consumption path than what this test
+exercises. `udmabuf`'s backing store is an ordinary `memfd`; this repro reads
+and writes it with plain `pread()`/`pwrite()` on the memfd directly (same
+physical pages, no mmap involved), so the mmap coherency contract never comes
+up. AMD VRAM verification goes through `hipMemcpy`, which doesn't touch the
+dmabuf mmap path either. The `WRITE_FIXED`/`READ_FIXED` DMA itself is
+mediated by the kernel dma-buf attachment machinery — no userspace ioctl is
+needed for that in either exporter. `DMA_BUF_SYNC` only appears in §7.4
+because that repro chooses to verify udmabuf contents via `mmap()` instead;
+it does not test the WRITE_FIXED/READ_FIXED path any harder.
+
+Like §7.4, this redeclares its own minimal dma-buf registration ABI structs
+and calls them via the raw `io_uring_register(2)` syscall, so it builds
+against any stock `liburing-dev`. Verified: strict-warning build (`-Wall
+-Wextra -Wswitch-enum -Wformat=2`) and `gcc -fanalyzer`, both zero warnings,
+against a genuinely stock (pre-dma-buf-patch) liburing header tree.
+
+Expected output on this hardware:
+```
+udmabuf round trip: PASS
+amdgpu  round trip: FAIL
+```
 
 ---
 

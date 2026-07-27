@@ -14,7 +14,7 @@ path is confirmed healthy via a `udmabuf` (host-memory) control.
 > direction. Once the standalone C repro was extended to test `WRITE_FIXED` and
 > `READ_FIXED` **independently** (§7.3), the result reversed: `WRITE_FIXED` is
 > clean (0/2560, every byte checked) and `READ_FIXED` is broken (2558/2560,
-> ~99.9%). §1, §5, and §9 below reflect the corrected conclusion. §4's iteration
+> ~99.9%). §1, §5, and §10 below reflect the corrected conclusion. §4's iteration
 > table and the earlier §7.1/§7.2 sections are left as an accurate record of what
 > was run and believed at the time — read them as history, not current truth —
 > because the methodology mistake (round-trip tests can't isolate direction) is
@@ -857,7 +857,95 @@ amdgpu  READ_FIXED : FAIL
 
 ---
 
-## 9. One-paragraph handoff
+## 9. PCIe root-complex P2P routing experiment (2026-07-27)
+
+Two NVMe devices: `d1` (same root complex/PCIe domain as the GPU) and `d2`
+(a different root complex). `drivers/pci/p2pdma.c` gates P2P DMA between two
+devices on a vendor/root-complex whitelist (`pci_p2pdma_whitelist_entry`);
+the root complex hosting the GPU and `d1` was **not** on that whitelist by
+default. Two configurations were tested:
+
+- **Scenario 1**: a local patch adds that root complex's vendor ID to the
+  whitelist, so the kernel recognizes `d1` as P2P-capable with the GPU.
+- **Scenario 2**: no patch — the default kernel behavior, and what every
+  prior result in this doc was measured under.
+
+| Scenario | Device | Root complex vs. GPU | Op | Userspace error | dmesg | Verification |
+|---|---|---|---|---|---|---|
+| 1: whitelist patch (P2P recognized) | `d1` | same | WRITE | **I/O error** | **I/O error, LBA 0, 1024, 2048, 3072** | — (op failed) |
+| 1: whitelist patch (P2P recognized) | `d1` | same | READ | none | none | **PASS** |
+| 1: whitelist patch (P2P recognized) | `d2` | different | WRITE | none | none | FAIL |
+| 1: whitelist patch (P2P recognized) | `d2` | different | READ | none | none | FAIL |
+| 2: no patch (baseline, all prior results) | `d1` | same | WRITE | none | none | **PASS** |
+| 2: no patch (baseline, all prior results) | `d1` | same | READ | none | none | **FAIL** |
+| 2: no patch (baseline, all prior results) | `d2` | different | WRITE | none | none | FAIL |
+| 2: no patch (baseline, all prior results) | `d2` | different | READ | none | none | FAIL |
+
+**`d1`'s pass/fail pattern inverts completely between the two scenarios.**
+`d2` fails both directions in both scenarios regardless.
+
+### Why WRITE hard-fails once real P2P is enabled (scenario 1, `d1`)
+
+Read `drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c` and
+`drivers/gpu/drm/amd/amdgpu/amdgpu_object.c` (local kernel checkout at
+`~/kernel/linux`) to check this mechanistically:
+
+- `amdgpu_dma_buf_attach()` sets `attach->peer2peer = false` whenever
+  `pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0` — i.e. whenever
+  the kernel doesn't recognize a valid P2P route between the two root
+  complexes (exactly the no-whitelist default).
+- `amdgpu_dma_buf_pin()`/`amdgpu_dma_buf_map()` only allow `AMDGPU_GEM_DOMAIN_VRAM`
+  placement when `attach->peer2peer` is true; otherwise the BO is placed in
+  `AMDGPU_GEM_DOMAIN_GTT` (system memory) instead of real VRAM.
+- When `AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED` is set (true P2P VRAM case),
+  `amdgpu_bo_placement_from_domain()` in `amdgpu_object.c` additionally
+  constrains placement to the PCIe-visible VRAM aperture
+  (`places[c].lpfn = min_not_zero(places[c].lpfn, visible_pfn)`).
+
+So scenario 1 is the first time in this whole investigation that `d1` is
+actually doing real PCIe peer-to-peer VRAM DMA. That the failure mode changes
+from silent corruption to a **hard I/O error at specific LBAs** is consistent
+with a well-known, platform-level PCIe P2P asymmetry, independent of AMD or
+this kernel patch: `WRITE_FIXED` (GPU VRAM → NVMe) requires the NVMe
+controller to issue a **non-posted PCIe Memory Read Request** against the
+GPU's BAR address to pull the data — which requires the root complex to
+correctly route the **completion** back to the NVMe device. `READ_FIXED`
+(NVMe → GPU VRAM) only requires a **posted Memory Write** into the GPU's BAR
+— fire-and-forget, no completion routing needed. Root complexes/PCIe
+switches that lack full P2P completion-routing support (a common limitation
+outside server-class platforms with ACS/P2P-aware fabric) can therefore
+support P2P writes into a peer while failing P2P reads from a peer — exactly
+the WRITE-fails/READ-passes pattern seen once real P2P is switched on. The
+clean, LBA-aligned I/O error (rather than silent corruption) is also
+consistent with this: a root complex that can't route the read completion
+typically surfaces that as a genuine completion-timeout/error, not
+corruption.
+
+**Not yet explained**: why the baseline (scenario 2, no whitelist,
+`peer2peer=false`) shows the *opposite* asymmetry for `d1` (write passes,
+read silently fails). If `peer2peer=false` really forces the BO into GTT for
+both directions, both should reduce to ordinary IOMMU-mediated host-memory
+DMA and behave symmetrically, like the `udmabuf` control has throughout this
+doc. That they don't suggests either the GTT fallback isn't happening the way
+the code above implies, or some other path still exercises a partial/limited
+form of P2P even without the whitelist entry. Direct verification needed:
+confirm via debugfs (`amdgpu_bo_list` / `amdgpu_vram_mgr` under
+`/sys/kernel/debug/dri/<N>/`) whether the `d1` no-patch-baseline BO actually
+lands in `TTM_PL_VRAM` or `TTM_PL_TT` (GTT) — this settles whether the
+baseline case is really avoiding P2P VRAM access at all, which the current
+code reading assumes but hasn't confirmed on hardware.
+
+This also refines (not necessarily overturns) §10's "localized to the AMD GPU
+exporter" conclusion: the defect may be better characterized as a
+**root-complex/PCIe-topology P2P routing limitation that the AMD VRAM peer-DMA
+path is sensitive to**, rather than a pure amdgpu software bug — `d2`
+(different root complex) fails outright in both directions in both
+scenarios, consistent with that root complex having no usable P2P route to
+the GPU at all, patched whitelist or not.
+
+---
+
+## 10. One-paragraph handoff
 
 The LMCache io_uring DMA-BUF backend is functionally complete on the software
 side (export, registration, slot lifecycle, write path, and teardown reviewed at

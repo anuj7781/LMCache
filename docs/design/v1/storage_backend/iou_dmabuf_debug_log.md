@@ -921,6 +921,22 @@ consistent with this: a root complex that can't route the read completion
 typically surfaces that as a genuine completion-timeout/error, not
 corruption.
 
+**Confirmed which P2P routing mode is actually in play**, not just assumed:
+`drivers/pci/p2pdma.c:calc_map_type_and_dist()` only consults the host-bridge
+whitelist at all when the two devices have no common PCIe switch in their
+path (or ACS redirect forces host-bridge routing even if they do) —
+device pairs that share a switch resolve to `PCI_P2PDMA_MAP_BUS_ADDR` and
+never touch the whitelist. Since `d1` required the whitelist patch to be
+recognized as P2P-capable, `d1`↔GPU is confirmed to resolve to
+`PCI_P2PDMA_MAP_THRU_HOST_BRIDGE` — the weaker-guarantee mode where the root
+complex itself must forward the transaction between its own root ports,
+rather than a PCIe switch mediating directly between peers. This is
+precisely the class of P2P route most commonly reported (across vendors, not
+AMD-specific) to support posted writes into a peer without reliably
+supporting the completion routing non-posted reads need — so the
+WRITE-hard-fails/READ-passes asymmetry isn't just plausible in general, it
+matches the specific routing mode these two devices actually use.
+
 **Not yet explained**: why the baseline (scenario 2, no whitelist,
 `peer2peer=false`) shows the *opposite* asymmetry for `d1` (write passes,
 read silently fails). If `peer2peer=false` really forces the BO into GTT for

@@ -58,19 +58,52 @@
 typedef int CUresult;
 typedef int CUdevice;
 typedef unsigned long long CUdeviceptr;
+typedef unsigned long long CUmemGenericAllocationHandle;
 typedef struct CUctx_st *CUcontext;
 enum {
     CUDA_SUCCESS = 0,
-    CU_MEM_RANGE_HANDLE_TYPE_DMABUF_FD = 0x1,
+    CU_MEM_ALLOCATION_TYPE_PINNED = 0x1,
+    CU_MEM_LOCATION_TYPE_DEVICE = 0x1,
+    CU_MEM_HANDLE_TYPE_NONE = 0x0,
+    CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 0x3,
+    CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0x0,
+    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 0x1,
+    CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102,
 };
 
+// Struct layouts verified against the real cuda.h (CUDA 12.9,
+// nvidia-cuda-runtime-cu12 wheel) -- field order/padding matters here since
+// these are passed by pointer to the real driver, not just used internally.
+typedef struct {
+    int type;
+    int id;
+} CUmemLocation;
+
+typedef struct {
+    int type;
+    int requestedHandleTypes;
+    CUmemLocation location;
+    void *win32HandleMetaData;
+    struct {
+        unsigned char compressionType;
+        unsigned char gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char reserved[4];
+    } allocFlags;
+} CUmemAllocationProp;
+
+typedef struct {
+    CUmemLocation location;
+    int flags;
+} CUmemAccessDesc;
+
 extern CUresult cuInit(unsigned int flags);
+extern CUresult cuDeviceGetCount(int *count);
 extern CUresult cuDeviceGet(CUdevice *device, int ordinal);
+extern CUresult cuDeviceGetAttribute(int *pi, int attrib, CUdevice dev);
 extern CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
 extern CUresult cuCtxDestroy_v2(CUcontext ctx);
 extern CUresult cuCtxSynchronize(void);
-extern CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize);
-extern CUresult cuMemFree_v2(CUdeviceptr dptr);
 extern CUresult cuMemcpyHtoD_v2(CUdeviceptr dst, const void *src, size_t bytes);
 extern CUresult cuMemcpyDtoH_v2(void *dst, CUdeviceptr src, size_t bytes);
 extern CUresult cuMemsetD8_v2(CUdeviceptr dst, unsigned char value, size_t n);
@@ -78,6 +111,29 @@ extern CUresult cuMemGetHandleForAddressRange(void *handle, CUdeviceptr dptr,
                                               size_t size, int handleType,
                                               unsigned long long flags);
 extern CUresult cuGetErrorString(CUresult error, const char **str);
+
+// Virtual Memory Management (VMM) API: plain cuMemAlloc does not reliably
+// support cuMemGetHandleForAddressRange (see
+// docs/design/v1/storage_backend/iou_dmabuf_backend.md, "Approach B") -- VMM
+// allocation is the guaranteed-exportable path, so that's what's used here
+// instead of cuMemAlloc.
+extern CUresult cuMemGetAllocationGranularity(size_t *granularity,
+                                              const CUmemAllocationProp *prop,
+                                              int option);
+extern CUresult cuMemAddressReserve(CUdeviceptr *ptr, size_t size,
+                                    size_t alignment, CUdeviceptr addr,
+                                    unsigned long long flags);
+extern CUresult cuMemCreate(CUmemGenericAllocationHandle *handle, size_t size,
+                            const CUmemAllocationProp *prop,
+                            unsigned long long flags);
+extern CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+                         CUmemGenericAllocationHandle handle,
+                         unsigned long long flags);
+extern CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size,
+                               const CUmemAccessDesc *desc, size_t count);
+extern CUresult cuMemUnmap(CUdeviceptr ptr, size_t size);
+extern CUresult cuMemRelease(CUmemGenericAllocationHandle handle);
+extern CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size);
 
 #define DMABUF_REGBUF_TYPE 2
 #define DMABUF_RSRC_UPDATE_EXTENDED (1u << 1)
@@ -93,6 +149,7 @@ struct dmabuf_regbuf_desc {
 };
 
 // Exactly one of {memfd, gpu_ptr} is meaningful, depending on gpu.
+// phys_handle/mapped_size are VMM-path-only (see create_nvidia()).
 struct exporter {
     const char *name;
     int gpu;
@@ -100,6 +157,8 @@ struct exporter {
     int memfd;
     CUdeviceptr gpu_ptr;
     CUcontext cuda_ctx;
+    CUmemGenericAllocationHandle phys_handle;
+    size_t mapped_size;
 };
 
 static void die(const char *what)
@@ -175,18 +234,59 @@ static struct exporter create_nvidia(void)
 {
     struct exporter exp = {.name = "nvidia", .gpu = 1, .dmabuf_fd = -1};
     CUdevice dev;
+    CUmemAllocationProp prop = {0};
+    CUmemAccessDesc access = {0};
+    size_t granularity = 0;
+    int count = 0, vmm_supported = 0;
 
     cuda_check(cuInit(0), "cuInit");
+    cuda_check(cuDeviceGetCount(&count), "cuDeviceGetCount");
+    if (count == 0) {
+        fprintf(stderr, "no CUDA devices found\n");
+        exit(2);
+    }
     cuda_check(cuDeviceGet(&dev, 0), "cuDeviceGet");
     cuda_check(cuCtxCreate_v2(&exp.cuda_ctx, 0, dev), "cuCtxCreate");
-    cuda_check(cuMemAlloc_v2(&exp.gpu_ptr, IO_SIZE), "cuMemAlloc");
+
+    cuda_check(cuDeviceGetAttribute(
+                   &vmm_supported,
+                   CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev),
+              "cuDeviceGetAttribute(VMM)");
+    if (!vmm_supported) {
+        fprintf(stderr, "device does not support the VMM API\n");
+        exit(2);
+    }
+
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = (int)dev;
+
+    cuda_check(cuMemGetAllocationGranularity(&granularity, &prop,
+                                             CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+              "cuMemGetAllocationGranularity");
+    exp.mapped_size = (IO_SIZE + granularity - 1) / granularity * granularity;
+
+    cuda_check(cuMemAddressReserve(&exp.gpu_ptr, exp.mapped_size, granularity,
+                                   0, 0),
+              "cuMemAddressReserve");
+    cuda_check(cuMemCreate(&exp.phys_handle, exp.mapped_size, &prop, 0),
+              "cuMemCreate");
+    cuda_check(cuMemMap(exp.gpu_ptr, exp.mapped_size, 0, exp.phys_handle, 0),
+              "cuMemMap");
+
+    access.location = prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    cuda_check(cuMemSetAccess(exp.gpu_ptr, exp.mapped_size, &access, 1),
+              "cuMemSetAccess");
+
     if (exp.gpu_ptr % (CUdeviceptr)sysconf(_SC_PAGESIZE)) {
-        fprintf(stderr, "cuMemAlloc returned an unaligned address\n");
+        fprintf(stderr, "cuMemAddressReserve returned an unaligned address\n");
         exit(2);
     }
     cuda_check(cuMemGetHandleForAddressRange(
-                   &exp.dmabuf_fd, exp.gpu_ptr, IO_SIZE,
-                   CU_MEM_RANGE_HANDLE_TYPE_DMABUF_FD, 0),
+                   &exp.dmabuf_fd, exp.gpu_ptr, exp.mapped_size,
+                   CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
               "cuMemGetHandleForAddressRange");
     return exp;
 }
@@ -195,7 +295,10 @@ static void close_exporter(struct exporter *exp)
 {
     if (exp->gpu) {
         close(exp->dmabuf_fd);
-        cuda_check(cuMemFree_v2(exp->gpu_ptr), "cuMemFree");
+        cuda_check(cuMemUnmap(exp->gpu_ptr, exp->mapped_size), "cuMemUnmap");
+        cuda_check(cuMemRelease(exp->phys_handle), "cuMemRelease");
+        cuda_check(cuMemAddressFree(exp->gpu_ptr, exp->mapped_size),
+                  "cuMemAddressFree");
         cuda_check(cuCtxDestroy_v2(exp->cuda_ctx), "cuCtxDestroy");
     } else {
         close(exp->dmabuf_fd);

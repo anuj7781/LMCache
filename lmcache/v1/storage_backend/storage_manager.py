@@ -321,8 +321,13 @@ class StorageManager:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
             else:
                 allocator_backend = self.storage_backends["MaruBackend"]
-        else:
+        elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
+        else:
+            # IouDmabufBackend intentionally does not appear here: it requires a
+            # LocalCPUBackend staging allocator (enforced in CreateStorageBackends)
+            # so it is never the global allocator. See iou_dmabuf_backend design.
+            raise RuntimeError("No allocator backend is available")
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
@@ -450,7 +455,13 @@ class StorageManager:
             memory_obj = backend.get_blocking(key)
             if memory_obj:
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    backend_name
+                    not in [
+                        "LocalCPUBackend",
+                        "PDBackend",
+                        "MaruBackend",
+                        "IouDmabufBackend",
+                    ]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
@@ -494,7 +505,13 @@ class StorageManager:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                    backend_name
+                    not in [
+                        "LocalCPUBackend",
+                        "PDBackend",
+                        "MaruBackend",
+                        "IouDmabufBackend",
+                    ]
                     and "LocalCPUBackend" in self.storage_backends
                     and None not in memory_objs
                 ):

@@ -25,9 +25,12 @@ disposable namespace.**
   the PyTorch allocation cannot be exported the backend fails to initialize.
 - NVIDIA requires `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` to be true before
   requesting a DMA-BUF fd, and page-aligned pointer and size.
-- The NVIDIA exporter maps VRAM through BAR1. There is no generic
-  system-memory fallback in the io_uring/NVMe importer: if the NVMe cannot reach
-  the GPU peer-to-peer, expect attach, mapping, registration or I/O to fail.
+- The NVIDIA exporter returns a DMA-BUF for GPU memory. Passing
+  `CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE` requests a PCIe BAR1 mapping
+  and fails when that mapping is unsupported. Neither io_uring nor the NVMe
+  importer provides a generic system-memory bounce fallback: if the NVMe cannot
+  reach the GPU peer-to-peer, plan for attach, mapping, registration or I/O to
+  fail.
 - RTX 5090 needs CUDA 12.8+, a PyTorch build with `sm_120`, and NVIDIA's open
   kernel modules.
 - The NVMe path needs a kernel with the io_uring DMA-BUF series
@@ -458,9 +461,29 @@ export SAFE_TEST_OFFSET=$((4 << 30))
 lsblk -o NAME,PATH,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL "$SCRATCH_NVME"
 ```
 
-Device access needs root or the `disk` group. Plain `sudo python` bypasses the
-venv; if running as root is preferred over group access, use the venv's
-interpreter explicitly: `sudo "$VIRTUAL_ENV/bin/python" ...`.
+Device access needs root or the `disk` group. Prefer group or ACL access to
+the approved device granted by the machine owner. Plain `sudo python` bypasses
+the venv. `sudo "$VIRTUAL_ENV/bin/python"` keeps the venv's interpreter and
+packages, but sudo can still change `HOME`, drop environment variables
+(including `LD_LIBRARY_PATH`), put caches under `/root`, and leave root-owned
+result files. If sudo is unavoidable, pass the environment explicitly:
+
+```bash
+sudo env \
+  TEST_ROOT="$TEST_ROOT" \
+  XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+  CUDA_CACHE_PATH="$CUDA_CACHE_PATH" \
+  TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR" \
+  TRITON_CACHE_DIR="$TRITON_CACHE_DIR" \
+  ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
+  "$VIRTUAL_ENV/bin/python" \
+  tools/probe_iou_dmabuf_e2e.py \
+  --device-path "$SCRATCH_NVME" \
+  --device-offset "$SAFE_TEST_OFFSET"
+```
+
+Add `--write` only after approval (stage 14). Run the `| tee` of a sudo command
+as your own user so result files stay yours, or `chown` them afterwards.
 
 Optionally, rerun the device-backed upstream tests against the approved
 namespace:

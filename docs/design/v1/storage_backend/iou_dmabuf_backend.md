@@ -67,8 +67,10 @@ Without `CONFIG_DMABUF_TOKEN` the backend must refuse to initialize and log a cl
 error. What happens without P2P depends on the exporter, not on io_uring or
 nvme-pci (the importer has no bounce-buffer fallback). amdgpu can move the
 buffer to system memory (GTT) and hand the NVMe a system-memory mapping, so I/O
-still works but without the zero-copy benefit. The NVIDIA exporter maps VRAM
-through BAR1 and is not known to have such a fallback: expect attach, mapping,
+still works but without the zero-copy benefit. The NVIDIA exporter returns a
+DMA-BUF for GPU memory; passing `CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE`
+requests a PCIe BAR1 mapping and fails when that mapping is unsupported. No
+system-memory fallback is documented for it, so plan for attach, mapping,
 registration or I/O to fail if the NVMe cannot reach the GPU peer-to-peer. See
 §13 for P2P observability requirements.
 
@@ -1228,8 +1230,8 @@ also probe the PCIe mapping flag (`1` for both
 
 Whether P2P (PCIe peer-to-peer DMA) is needed for correctness depends on the
 exporter (§2.1). With amdgpu, a missing P2P path can mean a system-memory (GTT)
-mapping that works without zero-copy; with NVIDIA, expect failure rather than a
-fallback. Routing through a PCIe host bridge is still P2P, not a copy through
+mapping that works without zero-copy; for NVIDIA no such fallback is
+documented, so plan for failure. Routing through a PCIe host bridge is still P2P, not a copy through
 system RAM. The first cut does not have a reliable userspace signal that proves
 the path selected for an individual I/O.
 

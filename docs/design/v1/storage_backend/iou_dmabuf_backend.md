@@ -64,9 +64,13 @@ GPU-resident sources.
 - NVMe block device (nvme-pci driver); `CONFIG_BLK_DEV_NVME=y`
 
 Without `CONFIG_DMABUF_TOKEN` the backend must refuse to initialize and log a clear
-error. Without P2P the kernel silently falls back to a system-RAM-mediated path —
-correctness is preserved, but the zero-copy benefit is lost. See §13 for P2P
-observability requirements.
+error. What happens without P2P depends on the exporter, not on io_uring or
+nvme-pci (the importer has no bounce-buffer fallback). amdgpu can move the
+buffer to system memory (GTT) and hand the NVMe a system-memory mapping, so I/O
+still works but without the zero-copy benefit. The NVIDIA exporter maps VRAM
+through BAR1 and is not known to have such a fallback: expect attach, mapping,
+registration or I/O to fail if the NVMe cannot reach the GPU peer-to-peer. See
+§13 for P2P observability requirements.
 
 ### 2.2 Userspace
 
@@ -1222,10 +1226,12 @@ also probe the PCIe mapping flag (`1` for both
 
 ## 13. P2P Observability and Fallback
 
-P2P (PCIe peer-to-peer DMA) is an optimization, not a correctness requirement.
-The kernel silently falls back to a host-memory-mediated path when P2P is
-unavailable. The first cut does not have a reliable userspace signal that proves the
-path selected for an individual I/O.
+Whether P2P (PCIe peer-to-peer DMA) is needed for correctness depends on the
+exporter (§2.1). With amdgpu, a missing P2P path can mean a system-memory (GTT)
+mapping that works without zero-copy; with NVIDIA, expect failure rather than a
+fallback. Routing through a PCIe host bridge is still P2P, not a copy through
+system RAM. The first cut does not have a reliable userspace signal that proves
+the path selected for an individual I/O.
 
 ### 13.1 Startup diagnostic
 
@@ -1239,7 +1245,7 @@ Deferred production work may attempt to determine P2P status at startup:
 - On NVIDIA: check `nvidia-smi` p2p matrix or driver sysfs nodes.
 - Log the result at INFO level:
   `"P2P DMA: best-effort verified (GPU and NVMe appear to share a PCIe switch)"` or
-  `"P2P DMA: unverified (topology check inconclusive; kernel may fall back to host-memory path)"`.
+  `"P2P DMA: unverified (topology check inconclusive; I/O may not be peer-to-peer)"`.
   This is a heuristic, not a kernel-confirmed signal. See §13.3.
 
 ### 13.2 `require_p2p` config key

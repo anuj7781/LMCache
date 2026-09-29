@@ -7,12 +7,13 @@ results. Design and contracts are in
 [iou_dmabuf_backend.md](iou_dmabuf_backend.md).
 
 **Summary:** the branch builds from scratch on ROCm 7.14, all new unit tests
-pass, the existing upstream raw-block / storage-manager / local-CPU /
-local-disk tests show no regressions, and the real GPU-export and
-NVMe io_uring DMA-BUF paths work on hardware. The only failures observed are
-(1) an upstream test whose timeout is too short for this machine (not caused
-by this branch) and (2) the known, pre-existing AMD exporter data-integrity
-issue under sustained load (see [Results](#results)).
+pass, and the existing upstream raw-block / storage-manager / local-CPU /
+local-disk tests show no regressions. On hardware, GPU DMA-BUF export and
+single-operation READ_FIXED/WRITE_FIXED probes complete successfully, but
+**sustained AMD operation is not data-integrity safe on this setup**: the
+integrity benchmark reports occasional corrupt chunks (a known AMD exporter /
+kernel issue that predates this branch). The only other failure is an upstream
+test whose timeout is too short for this machine (see [Results](#results)).
 
 ## Machine
 
@@ -25,6 +26,20 @@ issue under sustained load (see [Results](#results)).
 | Kernel | `7.3.0-rc3+`, patched with the io_uring DMA-BUF series (`CONFIG_DMABUF_TOKEN`) |
 | NVMe | `/dev/nvme0n1` (block) / `/dev/ng0n1` (char), 512-byte LBA |
 | LMCache build | `0.5.3.dev427` (editable) |
+
+## Revisions
+
+| Item | Value |
+|---|---|
+| LMCache commit tested | `8e858b7c` on `feat/iou-dmabuf-backend-dev`; its fixups were later squashed into `ecaebd35` with an identical tree |
+| Upstream LMCache base | `a2fd93e1` (`origin/dev`) |
+| Rust raw-block extension | built from `rust/raw_block` at the same LMCache commit (`maturin develop --release`) |
+| Kernel DMA-BUF series | FILL IN: series revision (e.g. v6) and branch |
+| Kernel commit | FILL IN: `git -C <kernel tree> rev-parse HEAD` of the booted build |
+| Kernel build | FILL IN: `uname -rv` |
+
+The io_uring DMA-BUF registration ABI is out of tree and still evolving; the
+Rust crate must match the booted kernel's series revision.
 
 ## Prerequisites
 
@@ -114,7 +129,8 @@ python -c "import torch; print(torch.__version__)"   # still +rocm7.13.0
 ```
 
 `probe_dmabuf_support()` returns `True` only on a kernel with
-`CONFIG_DMABUF_TOKEN`; the backend is silently skipped otherwise.
+`CONFIG_DMABUF_TOKEN`. Otherwise the backend is not instantiated, and the
+storage-backend factory logs a warning.
 
 Rust unit tests (as upstream CI runs them):
 
@@ -148,24 +164,36 @@ vLLM nor a real block device.
 
 ## 7. Hardware checks
 
-`--write` and the benchmark **overwrite data** on the target device at the
-offsets they use; point them at a scratch namespace.
+**These commands write to the raw device.** `probe_iou_dmabuf_e2e.py --write`
+overwrites `--length` bytes (default 4096) at `--device-offset`, which
+defaults to **0**, the start of the namespace (partition table / filesystem
+metadata). The benchmark has no base-offset option: `RawBlockCore` places its
+metadata region at the start of the device and data slots after it, so the
+benchmark needs an **entirely disposable namespace**, not just unused space at
+an offset. Never point either at a namespace holding data you need.
 
 ```bash
-# GPU memory -> DMA-BUF export, exactly as the backend allocates it
+SCRATCH_NVME=/dev/nvmeXnY        # a disposable namespace
+sudo lsblk "$SCRATCH_NVME"       # confirm: no partitions or filesystems you need
+
+# GPU memory -> DMA-BUF export, exactly as the backend allocates it (no device I/O)
 python tools/probe_gpu_dmabuf_export.py --size-mib 960
 
-# io_uring DMA-BUF registration + READ_FIXED, then WRITE_FIXED
-python tools/probe_iou_dmabuf_e2e.py --device-path /dev/nvme0n1
-python tools/probe_iou_dmabuf_e2e.py --device-path /dev/nvme0n1 --write
+# io_uring DMA-BUF registration + READ_FIXED (read-only)
+python tools/probe_iou_dmabuf_e2e.py --device-path "$SCRATCH_NVME" \
+  --device-offset $((4 << 30))
 
-# Full backend put/get with byte-for-byte verification
+# ... then WRITE_FIXED (destructive at the given offset)
+python tools/probe_iou_dmabuf_e2e.py --device-path "$SCRATCH_NVME" \
+  --write --device-offset $((4 << 30))
+
+# Full backend put/get with byte-for-byte verification (whole namespace is disposable)
 python benchmarks/storage_backend_io/iou_dmabuf_io_benchmark.py \
-  --device-path /dev/nvme0n1 --num-ops 128 --concurrency 4 --verify-integrity
+  --device-path "$SCRATCH_NVME" --num-ops 128 --concurrency 4 --verify-integrity
 
 # Sustained load (~50 GiB of traffic)
 python benchmarks/storage_backend_io/iou_dmabuf_io_benchmark.py \
-  --device-path /dev/nvme0n1 --num-ops 128 --concurrency 8 --target-gib 50 --verify-integrity
+  --device-path "$SCRATCH_NVME" --num-ops 128 --concurrency 8 --target-gib 50 --verify-integrity
 ```
 
 ## Results
@@ -180,7 +208,7 @@ Validated 2026-09-28 on the machine above.
 | `test_raw_block_core.py` | all passed |
 | Upstream regression files (step 6, second command) | 140 passed, 2 skipped, 1 failed (see below) |
 | `probe_gpu_dmabuf_export.py` | OK |
-| `probe_iou_dmabuf_e2e.py` (READ_FIXED and WRITE_FIXED) | OK |
+| `probe_iou_dmabuf_e2e.py` (single READ_FIXED and WRITE_FIXED) | OK |
 | Integrity benchmark | Occasional mismatches, same as before this port (known AMD issue, below) |
 
 **`test_uring_cmd_middle_build_error_does_not_hang` fails on this machine,
